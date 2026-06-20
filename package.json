@@ -1,0 +1,10 @@
+{
+  "name": "bol-editor",
+  "private": true,
+  "version": "1.0.0",
+  "description": "BOL Editor — upload a PDF, click numbers to erase them; backend redacts them and fills with the background color.",
+  "scripts": {
+    "dev": "cd server && ./run.sh",
+    "start": "cd server && ./run.sh"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bol-editor",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "5566", "--directory", "/Users/abdurahmon/Documents/coding/projects/bol-editor"],
+      "port": 5566
+    }
+  ]
+}
