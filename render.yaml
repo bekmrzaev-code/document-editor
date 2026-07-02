@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: document-editor
+    name: bol-editor
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .

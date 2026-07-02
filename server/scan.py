@@ -195,13 +195,25 @@ def _ring_fill(img, x0, y0, x1, y1):
     return fill, frac
 
 
-def inpaint(png_bytes: bytes, rects: list, dilate: int = 3, radius: int = 4, flat_threshold: float = 0.7) -> bytes:
-    """Remove each rect. Where the surrounding background is uniform (e.g. a white
+def inpaint(png_bytes: bytes, rects: list, dilate: int = 3, radius: int = 4,
+            flat_threshold: float = 0.7, fixed_rgb: tuple | None = None) -> bytes:
+    """Remove each rect.
+
+    When ``fixed_rgb`` is given (r, g, b), every rect is painted with that exact
+    color — this backs the UI's "Fixed" fill mode and the eyedropper, so the
+    user's chosen color actually persists in the result.
+
+    Otherwise ("auto"): where the surrounding background is uniform (e.g. a white
     scan), fill it with that clean background color — no blur. Only where the
-    background is textured/varied do we reconstruct it with inpainting."""
+    background is textured/varied do we reconstruct it with inpainting.
+    """
     img = _to_cv(png_bytes)
     h, w = img.shape[:2]
     mask = np.zeros((h, w), np.uint8)
+    fixed_bgr = None
+    if fixed_rgb is not None:
+        r, g, b = (int(v) for v in fixed_rgb)
+        fixed_bgr = np.array([b, g, r], dtype=np.uint8)     # OpenCV is BGR
     touched = False
     for r in rects:
         try:
@@ -213,6 +225,9 @@ def inpaint(png_bytes: bytes, rects: list, dilate: int = 3, radius: int = 4, fla
         if x1 <= x0 or y1 <= y0:
             continue
         touched = True
+        if fixed_bgr is not None:
+            img[y0:y1, x0:x1] = fixed_bgr                    # exact user-chosen color
+            continue
         fill, frac = _ring_fill(img, x0, y0, x1, y1)
         if frac >= flat_threshold:
             img[y0:y1, x0:x1] = fill.astype(np.uint8)      # clean flat background, no blur

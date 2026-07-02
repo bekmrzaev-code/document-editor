@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import Editor from "./engine/Editor.js";
 import BrushPanel from "./BrushPanel.jsx";
 

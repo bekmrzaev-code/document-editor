@@ -5,10 +5,9 @@ BOL Editor — backend.
                         (text layer + Tesseract OCR), returns lightweight metadata.
   /api/page/{s}/{i}   — streams a full-resolution page PNG (lazy-loaded).
   /api/thumb/{s}/{i}  — streams a thumbnail PNG.
-  /api/enhance        — CamScanner-style filters: auto/magic/gray/B&W, brightness,
-                        contrast, sharpen, deskew, auto edge-detect & crop.
-  /api/process        — true PyMuPDF redaction (text removed + background fill).
-  /api/export         — assembles edited page images into a downloadable PDF.
+  /api/inpaint        — seamless removal of rectangles (auto background or fixed fill).
+  /api/export         — flattens edited page images into a downloadable PDF (no
+                        recoverable text layer — erased numbers are truly gone).
 
 Also serves the static frontend, so one `uvicorn` command runs everything.
 """
@@ -17,21 +16,20 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import time
 import uuid
-from collections import defaultdict
 from pathlib import Path
 
 import fitz  # PyMuPDF
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image as PILImage
-from pydantic import BaseModel
 
-import scan  # local image-enhancement engine
+import scan  # local image-processing engine (seamless removal + OCR preprocessing)
 
 # ── Optional OCR (used when a page has no text layer) ───────────────────────
 try:
@@ -41,23 +39,82 @@ try:
 except Exception:
     HAS_OCR = False
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 ROOT = Path(__file__).resolve().parent.parent          # the bol-editor/ folder
 RENDER_SCALE = 2.0                                     # points → pixels (digital PDFs)
 MAX_DIM = 2200                                         # cap longest page side (px)
 THUMB_WIDTH = 220
-SESSION_TTL = 3600
+SESSION_TTL = _env_int("SESSION_TTL", 3600)            # seconds a session lives (idle)
+
+# ── Abuse guards (the app stays open to everyone — these only stop DoS) ──────
+MAX_UPLOAD_BYTES = _env_int("MAX_UPLOAD_BYTES", 30 * 1024 * 1024)   # 30 MB per upload
+MAX_PAGES = _env_int("MAX_PAGES", 60)                              # cap pages per doc
+# Guard Pillow against decompression-bomb images (~40 MP ceiling).
+PILImage.MAX_IMAGE_PIXELS = _env_int("MAX_IMAGE_PIXELS", 40_000_000)
+
 SESSIONS: dict[str, dict] = {}
 
 app = FastAPI(title="BOL Editor API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Same-origin (the backend serves the UI) needs no CORS at all. Set
+# ALLOWED_ORIGINS="https://a.com,https://b.com" only if you host the UI elsewhere.
+_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if _origins:
+    app.add_middleware(CORSMiddleware, allow_origins=_origins,
+                       allow_methods=["*"], allow_headers=["*"])
+
+
+# ── Lightweight per-IP rate limiting for the heavy endpoints ────────────────
+# Generous by design: a real user won't hit these; a script hammering the box will.
+RATE_LIMITS = {                                        # path → (max requests, window seconds)
+    "/api/analyze": (_env_int("RL_ANALYZE", 40), 60),
+    "/api/inpaint": (_env_int("RL_INPAINT", 200), 60),
+    "/api/export": (_env_int("RL_EXPORT", 40), 60),
+}
+_hits: dict[tuple, list] = {}
+
+
+def _client_ip(request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "?"
 
 
 @app.middleware("http")
-async def no_cache_static(request, call_next):
-    """Always revalidate HTML/JS/CSS so the browser never runs stale code."""
+async def rate_limit(request, call_next):
+    limit = RATE_LIMITS.get(request.url.path)
+    if limit:
+        cap, window = limit
+        now = time.time()
+        key = (request.url.path, _client_ip(request))
+        recent = [t for t in _hits.get(key, []) if now - t < window]
+        if len(recent) >= cap:
+            return JSONResponse({"detail": "Too many requests — please slow down."},
+                                status_code=429)
+        recent.append(now)
+        _hits[key] = recent
+        if len(_hits) > 5000:                          # occasional cleanup
+            for k in [k for k, v in _hits.items() if all(now - t > 120 for t in v)]:
+                _hits.pop(k, None)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def cache_headers(request, call_next):
+    """Cache Vite's hashed assets forever; always revalidate HTML."""
     resp = await call_next(request)
     p = request.url.path
-    if p == "/" or p.endswith((".html", ".js", ".css")):
+    if p.startswith("/assets/"):                       # immutable, content-hashed filenames
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif p == "/" or p.endswith(".html"):
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
@@ -130,39 +187,6 @@ def extract_number_runs(page):
     return out
 
 
-def hex_to_unit(hex_str: str):
-    h = hex_str.lstrip("#")
-    if len(h) != 6:
-        return (1.0, 1.0, 1.0)
-    return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
-
-
-def sample_background(pix, x0, y0, x1, y1):
-    W, H, n, stride, buf = pix.width, pix.height, pix.n, pix.stride, pix.samples
-    pad = max(4, int((y1 - y0) * 0.5))
-    ex0, ey0 = max(0, int(x0 - pad)), max(0, int(y0 - pad))
-    ex1, ey1 = min(W, int(x1 + pad)), min(H, int(y1 + pad))
-    ix0, iy0, ix1, iy1 = int(x0), int(y0), int(x1), int(y1)
-    counts: dict[tuple, list] = {}
-    for py in range(ey0, ey1):
-        inside_y = iy0 <= py < iy1
-        row = py * stride
-        for px in range(ex0, ex1):
-            if inside_y and ix0 <= px < ix1:
-                continue
-            off = row + px * n
-            r, g, b = buf[off], buf[off + 1], buf[off + 2]
-            key = (r & 0xF8, g & 0xF8, b & 0xF8)
-            c = counts.get(key)
-            if c is None:
-                counts[key] = c = [0, 0, 0, 0]
-            c[0] += 1; c[1] += r; c[2] += g; c[3] += b
-    if not counts:
-        return (1.0, 1.0, 1.0)
-    best = max(counts.values(), key=lambda c: c[0])
-    return (best[1] / best[0] / 255, best[2] / best[0] / 255, best[3] / best[0] / 255)
-
-
 def cleanup_sessions():
     now = time.time()
     for k in [k for k, v in SESSIONS.items() if now - v["created"] > SESSION_TTL]:
@@ -200,12 +224,21 @@ async def analyze(file: UploadFile = File(...)):
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty file")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
     try:
         doc, pdf_bytes = _open_document(data, file.filename, file.content_type or "")
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(400, "Could not open that file (PDF or image expected).")
-    if doc.page_count == 0:
+    n_pages = doc.page_count
+    if n_pages == 0:
+        doc.close()
         raise HTTPException(400, "Document has no pages")
+    if n_pages > MAX_PAGES:
+        doc.close()
+        raise HTTPException(413, f"Too many pages ({n_pages}); the limit is {MAX_PAGES}.")
 
     sid = uuid.uuid4().hex
     pages_out, pages_store = [], []
@@ -296,117 +329,46 @@ async def get_thumb(sid: str, idx: int):
     return _png(sess["pages"][idx]["thumb"])
 
 
-# ── /api/enhance (CamScanner-style) ─────────────────────────────────────────
-class EnhanceReq(BaseModel):
-    session: str
-    page: int
-    mode: str = "original"        # original | auto | magic | gray | bw
-    brightness: float = 0.0       # -100..100
-    contrast: float = 1.0         # 0.4..2.5
-    sharpen: float = 0.0          # 0..1.5
-    deskew: bool = False
-    autocrop: bool = False
-
-
-@app.post("/api/enhance")
-async def enhance(req: EnhanceReq = Body(...)):
-    sess = _get_session(req.session)
-    if not 0 <= req.page < len(sess["pages"]):
-        raise HTTPException(404, "No such page")
-    src = sess["pages"][req.page]["png"]
-    try:
-        out = scan.process(src, mode=req.mode, brightness=req.brightness,
-                           contrast=req.contrast, sharpen=req.sharpen,
-                           do_deskew=req.deskew, do_autocrop=req.autocrop)
-    except Exception as e:
-        raise HTTPException(500, f"Enhance failed: {e}")
-    return _png(out)
-
-
 # ── /api/inpaint (seamless removal) ─────────────────────────────────────────
+def _hex_to_rgb(hex_str: str):
+    h = (hex_str or "").lstrip("#")
+    if len(h) != 6:
+        return (255, 255, 255)
+    try:
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except ValueError:
+        return (255, 255, 255)
+
+
 @app.post("/api/inpaint")
-async def inpaint_ep(file: UploadFile = File(...), rects: str = Form("[]")):
+async def inpaint_ep(file: UploadFile = File(...), rects: str = Form("[]"),
+                     fillMode: str = Form("auto"), color: str = Form("#ffffff")):
     data = await file.read()
     if not data:
         raise HTTPException(400, "No image")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Image too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
     try:
         rs = json.loads(rects)
     except Exception:
         rs = []
+    fixed_rgb = _hex_to_rgb(color) if fillMode == "fixed" else None
     try:
-        out = scan.inpaint(data, rs)
+        out = scan.inpaint(data, rs, fixed_rgb=fixed_rgb)
     except Exception as e:
         raise HTTPException(500, f"Inpaint failed: {e}")
     return _png(out)
 
 
-# ── /api/process (true redaction) ───────────────────────────────────────────
-class Removal(BaseModel):
-    boxId: int
-
-
-class Manual(BaseModel):
-    page: int
-    x: float
-    y: float
-    w: float
-    h: float
-
-
-class ProcessReq(BaseModel):
-    session: str
-    removals: list[Removal] = []
-    manuals: list[Manual] = []
-    fillMode: str = "auto"
-    color: str = "#ffffff"
-
-
-@app.post("/api/process")
-async def process(req: ProcessReq = Body(...)):
-    sess = _get_session(req.session)
-    pages = sess["pages"]
-
-    id_map: dict[int, tuple[int, list]] = {}
-    for pidx, pm in enumerate(pages):
-        for b in pm["boxes"]:
-            id_map[b["id"]] = (pidx, b["rect"])
-
-    rects_by_page: dict[int, list] = defaultdict(list)
-    for r in req.removals:
-        hit = id_map.get(r.boxId)
-        if hit:
-            rects_by_page[hit[0]].append(hit[1])
-    for m in req.manuals:
-        s = pages[m.page]["scale"]
-        rects_by_page[m.page].append([m.x / s, m.y / s, (m.x + m.w) / s, (m.y + m.h) / s])
-
-    if not rects_by_page:
-        raise HTTPException(400, "Nothing selected to remove.")
-
-    doc = fitz.open(stream=sess["pdf"], filetype="pdf")
-    fixed_rgb = hex_to_unit(req.color)
-    for pidx, rects in rects_by_page.items():
-        page = doc[pidx]
-        s = pages[pidx]["scale"]
-        pix = page.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False, colorspace=fitz.csRGB) \
-            if req.fillMode == "auto" else None
-        for x0, y0, x1, y1 in rects:
-            color = sample_background(pix, x0 * s, y0 * s, x1 * s, y1 * s) \
-                if req.fillMode == "auto" else fixed_rgb
-            page.add_redact_annot(fitz.Rect(x0, y0, x1, y1), fill=color)
-        page.apply_redactions()
-
-    out = doc.tobytes(garbage=3, deflate=True)
-    doc.close()
-    return Response(content=out, media_type="application/pdf",
-                    headers={"Content-Disposition": 'attachment; filename="bol-cleaned.pdf"'})
-
-
 # ── /api/export (assemble edited page images into a PDF) ─────────────────────
+# The exported pages are already flattened to images by the client, so the PDF
+# carries no recoverable text layer — the erased numbers are truly gone.
 @app.post("/api/export")
 async def export(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(400, "No pages to export.")
+    if len(files) > MAX_PAGES:
+        raise HTTPException(413, f"Too many pages ({len(files)}); the limit is {MAX_PAGES}.")
     doc = fitz.open()
     try:
         for f in files:

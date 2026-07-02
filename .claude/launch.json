@@ -3,9 +3,10 @@
   "configurations": [
     {
       "name": "bol-editor",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "5566", "--directory", "/Users/abdurahmon/Documents/coding/projects/bol-editor"],
-      "port": 5566
+      "runtimeExecutable": "server/.venv/bin/uvicorn",
+      "runtimeArgs": ["app:app", "--app-dir", "server", "--host", "127.0.0.1", "--port", "8000"],
+      "cwd": "/Users/abdurahmon/Documents/coding/projects/bol-editor",
+      "port": 8000
     }
   ]
 }

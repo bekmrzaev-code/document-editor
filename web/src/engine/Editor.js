@@ -92,7 +92,10 @@ export default class Editor {
   emit() { this.onState(this.snapshot()); }
   toast(m, k) { this.onToast(m, k); }
 
-  setLoading(text) { this.loading = true; this.loadingText = text; this.progress = 0; clearTimeout(this._loaderTimer); this._loaderTimer = setTimeout(() => { this.loading = false; this.emit(); this.toast("That took too long — please retry.", "error"); }, 30000); this.emit(); }
+  // `timeout` is a safety net so a wedged request can't trap the UI forever.
+  // Long jobs (big uploads, multi-page export) pass a larger budget so they
+  // don't false-error while still working.
+  setLoading(text, timeout = 45000) { this.loading = true; this.loadingText = text; this.progress = 0; clearTimeout(this._loaderTimer); this._loaderTimer = setTimeout(() => { this.loading = false; this.emit(); this.toast("That took too long — please retry.", "error"); }, timeout); this.emit(); }
   setProgress(f) { this.progress = f; this.emit(); }
   hideLoader() { clearTimeout(this._loaderTimer); this.loading = false; this.emit(); }
   setStatus(s) { this.status = s; this.emit(); }
@@ -100,7 +103,7 @@ export default class Editor {
   /* ── load + analyze ─────────────────────────────────────────────────── */
   async open(file) {
     try {
-      this.setLoading("Uploading & analyzing…");
+      this.setLoading("Uploading & analyzing…", 120000);   // OCR + large scans can be slow
       const fd = new FormData(); fd.append("file", file);
       const res = await fetch(this.api + "/api/analyze", { method: "POST", body: fd });
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || `Server error ${res.status}`); }
@@ -126,7 +129,7 @@ export default class Editor {
 
       const total = this.pages.length, nums = this.pages.reduce((n, p) => n + p.boxes.length, 0);
       this.toast(`Loaded ${total} page${total > 1 ? "s" : ""} · ${nums} numbers found`, "success");
-    } catch (err) { console.error(err); this.hideLoader(); this.toast("Could not analyze that file", "error"); this.setStatus("Failed — " + (err.message || err)); }
+    } catch (err) { console.error(err); this.hideLoader(); this.toast(err.message || "Could not analyze that file", "error"); this.setStatus("Failed — " + (err.message || err)); }
   }
 
   /* ── layered page model ─────────────────────────────────────────────── */
@@ -261,6 +264,8 @@ export default class Editor {
       const fd = new FormData();
       fd.append("file", await canvasBlob(page.cleanCanvas), "clean.png");
       fd.append("rects", JSON.stringify(page.removals.map((r) => ({ x: r.x, y: r.y, w: r.w, h: r.h }))));
+      fd.append("fillMode", this.fillMode);              // "auto" | "fixed" — honored server-side
+      fd.append("color", this.fixedColor);
       const res = await fetch(this.api + "/api/inpaint", { method: "POST", body: fd });
       if (!res.ok) throw new Error("inpaint");
       const img = await loadImage(URL.createObjectURL(await res.blob()));
@@ -450,7 +455,7 @@ export default class Editor {
   download(blob, name) { const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
   async exportPng() { const page = this.pages[this.current]; if (!page) return; await this.doRefresh(page); this.download(await canvasBlob(page.canvas), `page-${this.current + 1}.png`); this.toast("PNG downloaded", "success"); }
   async exportPdf() {
-    this.setLoading("Building HD PDF…");
+    this.setLoading("Building HD PDF…", Math.max(45000, this.pages.length * 10000));
     try {
       const fd = new FormData();
       for (let i = 0; i < this.pages.length; i++) {

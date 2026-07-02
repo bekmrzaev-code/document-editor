@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from "react";
+import { useRef, useEffect } from "react";
 
 const STYLES = [
   { id: "pen", label: "Pen", w: 2.6, cap: "round", op: 1 },

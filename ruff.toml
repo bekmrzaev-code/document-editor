@@ -1,0 +1,9 @@
+# Lint config for the Python backend. Lenient on style (the codebase uses
+# compact multi-statement lines by design); strict on real problems (pyflakes).
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W"]
+# E701/E702: intentional one-liners.  E501: long lines.  E741: short var names.
+ignore = ["E501", "E701", "E702", "E741"]
