@@ -15,12 +15,30 @@ const I = {
   reset: <><path d="M3 2v6h6" /><path d="M3 13a9 9 0 1 0 3-7.7L3 8" /></>,
   autofix: <><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2" /><path d="m9 12 2 2 4-4" /></>,
   upload: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M12 18v-6" /><path d="m9 15 3-3 3 3" /></>,
+  copy: <><rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></>,
+  text: <><path d="M4 7V4h16v3" /><path d="M9 20h6" /><path d="M12 4v16" /></>,
+  shape: <><rect x="3" y="4" width="13" height="13" rx="1.5" /><circle cx="17" cy="17" r="4" /></>,
 };
 const Svg = ({ d, s = 20 }) => (
   <svg viewBox="0 0 24 24" width={s} height={s} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>
 );
 
-const TOOLS = [{ id: "erase", label: "Erase", icon: I.erase }, { id: "cover", label: "Cover", icon: I.cover }, { id: "brush", label: "Brush", icon: I.brush }];
+const TOOLS = [
+  { id: "erase", label: "Erase", icon: I.erase },
+  { id: "cover", label: "Cover", icon: I.cover },
+  { id: "text", label: "Text", icon: I.text, beta: true },
+  { id: "shape", label: "Shape", icon: I.shape, beta: true },
+  { id: "brush", label: "Brush", icon: I.brush },
+  { id: "copy", label: "Copy", icon: I.copy },
+];
+const SHAPES = [{ id: "rect", label: "Rect" }, { id: "ellipse", label: "Ellipse" }, { id: "line", label: "Line" }, { id: "arrow", label: "Arrow" }];
+
+/* Shared eyedropper button (used by every colour control). */
+const Pick = ({ picking, onClick }) => (
+  <button className={"pick-btn" + (picking ? " active" : "")} onClick={onClick} title="Eyedropper — pick a color from the document" aria-label="Pick color from document">
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m2 22 1-1h3l9-9" /><path d="M3 21v-3l9-9" /><path d="m15 6 3.4-3.4a2.1 2.1 0 0 1 3 3L18 9l.4.4a2.1 2.1 0 0 1 0 3 2.1 2.1 0 0 1-3 0L9 6.6a2.1 2.1 0 0 1 0-3 2.1 2.1 0 0 1 3 0z" /></svg>
+  </button>
+);
 
 export default function App() {
   const stageRef = useRef(null);
@@ -29,7 +47,7 @@ export default function App() {
   const fileRef = useRef(null);
   const engineRef = useRef(null);
 
-  const [s, setS] = useState(() => ({ hasDoc: false, loading: false, loadingText: "", progress: 0, tool: "erase", fillMode: "auto", fixedColor: "#ffffff", brushColor: "#e23744", brushSize: 8, showOverlays: true, current: -1, pageCount: 0, count: 0, mode: "original", scanned: false, ocrAvailable: false, canUndo: false, canRedo: false, status: "Ready — open a PDF or image to begin." }));
+  const [s, setS] = useState(() => ({ hasDoc: false, loading: false, loadingText: "", progress: 0, tool: "erase", fillMode: "auto", fixedColor: "#ffffff", brushColor: "#e23744", brushSize: 8, textColor: "#111827", textSize: 30, textBold: false, shapeType: "rect", shapeColor: "#e23744", shapeWidth: 4, showOverlays: true, current: -1, pageCount: 0, count: 0, mode: "original", scanned: false, ocrAvailable: false, canUndo: false, canRedo: false, status: "Ready — open a PDF or image to begin." }));
   const [toasts, setToasts] = useState([]);
   const [drag, setDrag] = useState(false);
 
@@ -45,13 +63,17 @@ export default function App() {
     engineRef.current = eng;
 
     const onKey = (e) => {
-      if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+      if (e.target.tagName === "TEXTAREA" || (e.target.tagName === "INPUT" && e.target.type !== "range")) return;
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? eng.redo() : eng.undo(); return; }
+      if (mod && e.key.toLowerCase() === "c") { e.preventDefault(); eng.copySelection(); return; }
+      if (mod && e.key.toLowerCase() === "v") { e.preventDefault(); eng.startPaste(); return; }
+      if (e.key === "Enter") { eng.commitPaste(); return; }
+      if (e.key === "Escape") { eng.cancelCopy(); return; }
       if (e.key === "+" || e.key === "=") { eng.zoomBy(1.2); return; }
       if (e.key === "-" || e.key === "_") { eng.zoomBy(1 / 1.2); return; }
       if (e.key === "0") { eng.zoomFit(); return; }
-      const map = { e: "erase", c: "cover", b: "brush" };
+      const map = { e: "erase", c: "cover", t: "text", r: "shape", b: "brush", y: "copy" };
       if (map[e.key]) eng.setTool(map[e.key]);
     };
     window.addEventListener("keydown", onKey);
@@ -94,6 +116,7 @@ export default function App() {
         <nav className="rail">
           {TOOLS.map((t) => (
             <button key={t.id} className={"tool" + (s.tool === t.id ? " active" : "")} title={t.label} onClick={() => eng().setTool(t.id)}>
+              {t.beta && <span className="beta">beta</span>}
               <Svg d={t.icon} /><span>{t.label}</span>
             </button>
           ))}
@@ -144,7 +167,65 @@ export default function App() {
 
         {/* Inspector */}
         <aside className="inspector">
-          {s.tool !== "brush" ? (
+          {s.tool === "brush" ? (
+            <BrushPanel s={s} eng={eng} />
+          ) : s.tool === "text" ? (
+            <section className="panel">
+              <div className="panel-head">Text</div>
+              <div className="color-row">
+                <input type="color" value={s.textColor} onChange={(e) => eng().setTextColor(e.target.value)} title="Text color" />
+                <div className="color-meta"><span className="color-label">Color</span><span className="color-hex">{s.textColor.toUpperCase()}</span></div>
+                <Pick picking={s.picking} onClick={() => eng().startPick("text")} />
+              </div>
+              <div className="field"><div className="field-label">Size <b>{s.textSize}px</b></div>
+                <input type="range" min="10" max="120" value={s.textSize} onChange={(e) => eng().setTextSize(e.target.value)} /></div>
+              <label className="toggle-row"><input type="checkbox" checked={s.textBold} onChange={(e) => eng().setTextBold(e.target.checked)} /><span>Bold</span></label>
+              <p className="hint-txt">Click the page to add text · Enter places it · Esc cancels.</p>
+            </section>
+          ) : s.tool === "shape" ? (
+            <section className="panel">
+              <div className="panel-head">Shape</div>
+              <div className="seg seg-wrap">
+                {SHAPES.map((sh) => (
+                  <button key={sh.id} className={"seg-btn" + (s.shapeType === sh.id ? " active" : "")} onClick={() => eng().setShapeType(sh.id)}>{sh.label}</button>
+                ))}
+              </div>
+              <div className="color-row">
+                <input type="color" value={s.shapeColor} onChange={(e) => eng().setShapeColor(e.target.value)} title="Shape color" />
+                <div className="color-meta"><span className="color-label">Color</span><span className="color-hex">{s.shapeColor.toUpperCase()}</span></div>
+                <Pick picking={s.picking} onClick={() => eng().startPick("shape")} />
+              </div>
+              <div className="field"><div className="field-label">Thickness <b>{s.shapeWidth}px</b></div>
+                <input type="range" min="1" max="30" value={s.shapeWidth} onChange={(e) => eng().setShapeWidth(e.target.value)} /></div>
+              <p className="hint-txt">Drag on the page to draw.</p>
+            </section>
+          ) : s.tool === "copy" ? (
+            <section className="panel">
+              <div className="panel-head">Copy &amp; paste</div>
+              <ol className="copy-steps">
+                <li>Drag a box over the area to copy.</li>
+                <li>Press <kbd>⌘</kbd>/<kbd>Ctrl</kbd>+<kbd>C</kbd> to copy it.</li>
+                <li>Press <kbd>⌘</kbd>/<kbd>Ctrl</kbd>+<kbd>V</kbd>, then drag / resize it and <b>Place</b>.</li>
+              </ol>
+              <div className="copy-status">
+                {s.pasteActive ? "Placing — drag to move, drag a corner to resize, then Place"
+                  : s.hasClipboard ? "Copied ✓ — ⌘/Ctrl+V to paste"
+                  : s.hasSelection ? "Selected — ⌘/Ctrl+C to copy"
+                  : "No selection yet"}
+              </div>
+              {s.pasteActive ? (
+                <>
+                  <button className="btn btn-primary wide" onClick={() => eng().commitPaste()}>✓ Place <span className="kbd-hint">Enter</span></button>
+                  <button className="btn btn-ghost wide" onClick={() => eng().cancelCopy()}>Cancel <span className="kbd-hint">Esc</span></button>
+                </>
+              ) : (
+                <>
+                  <button className="btn btn-ghost wide" disabled={!s.hasSelection} onClick={() => eng().copySelection()}>Copy selection</button>
+                  <button className="btn btn-primary wide" disabled={!s.hasClipboard} onClick={() => eng().startPaste()}>Paste →</button>
+                </>
+              )}
+            </section>
+          ) : (
             <section className="panel">
               <div className="panel-head">Fill color</div>
               <div className="seg">
@@ -162,8 +243,6 @@ export default function App() {
                 </button>
               </div>
             </section>
-          ) : (
-            <BrushPanel s={s} eng={eng} />
           )}
 
           <section className="panel">

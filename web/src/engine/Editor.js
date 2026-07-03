@@ -43,6 +43,18 @@ export default class Editor {
     this._stroke = null; this._strokePage = null; this._strokeCtx = null;
     this.fillMode = "auto";
     this.fixedColor = "#ffffff";
+    this.clipboard = null;         // { canvas, w, h } copied pixels (Copy tool)
+    this.pasteObj = null;          // floating { page, x, y, w, h } being positioned/resized
+    this._sel = null;              // { page, x, y, w, h } current Copy selection
+    // Text tool
+    this.textColor = "#111827";
+    this.textSize = 30;            // canvas px
+    this.textBold = false;
+    this._textEdit = null;         // { page, x, y, el } while typing
+    // Shapes tool
+    this.shapeType = "rect";       // rect | ellipse | line | arrow
+    this.shapeColor = "#e23744";
+    this.shapeWidth = 4;
     this.showOverlays = true;
     this.zoom = 1;
     this.undoStack = [];
@@ -80,7 +92,10 @@ export default class Editor {
       loading: this.loading, loadingText: this.loadingText, progress: this.progress,
       tool: this.tool, fillMode: this.fillMode, fixedColor: this.fixedColor,
       brushColor: this.brushColor, brushSize: this.brushSize, brushOpacity: this.brushOpacity, brushStyle: this.brushStyle,
+      textColor: this.textColor, textSize: this.textSize, textBold: this.textBold,
+      shapeType: this.shapeType, shapeColor: this.shapeColor, shapeWidth: this.shapeWidth,
       showOverlays: this.showOverlays, picking: !!this.pickMode,
+      hasSelection: !!this._sel, hasClipboard: !!this.clipboard, pasteActive: !!this.pasteObj,
       current: this.current, pageCount: this.pages.length, zoom: this.zoom,
       count: p ? p.boxes.filter((b) => !b.erased).length : 0,
       mode: p ? p.mode : "original",
@@ -155,6 +170,8 @@ export default class Editor {
 
   async showPage(index) {
     if (index < 0 || index >= this.pages.length) return;
+    if (this.pasteObj) this.commitPaste();          // bake any floating paste before leaving the page
+    if (this._textEdit) this.commitText();          // and any open text box
     const myNav = ++this.navSeq;
     const page = this.pages[index];
     if (!page.loaded) {
@@ -292,13 +309,84 @@ export default class Editor {
 
   /* ── brush (anno layer) ─────────────────────────────────────────────── */
   pushAnno(pageIndex, rect, before, after) { this.undoStack.push({ type: "anno", page: pageIndex, rect, before, after }); this.redoStack = []; this.updateThumb(pageIndex); this.emit(); }
-  commitStroke(page, snap, bbox) {
+  commitStroke(page, snap, bbox, margin) {
     if (!bbox) return;
-    const m = this.brushSize + 4;
+    const m = margin != null ? margin : this.brushSize + 4;
     const x = clamp(Math.floor(bbox.x0 - m), 0, page.w), y = clamp(Math.floor(bbox.y0 - m), 0, page.h);
     const w = clamp(Math.ceil(bbox.x1 - bbox.x0 + m * 2), 1, page.w - x), h = clamp(Math.ceil(bbox.y1 - bbox.y0 + m * 2), 1, page.h - y);
     this.pushAnno(this.current, { x, y, w, h }, snap.getContext("2d").getImageData(x, y, w, h), page.annoCtx.getImageData(x, y, w, h));
   }
+
+  /* ── shapes ─────────────────────────────────────────────────────────── */
+  drawShape(ctx, type, a, b) {
+    ctx.save();
+    ctx.strokeStyle = this.shapeColor; ctx.lineWidth = this.shapeWidth; ctx.lineCap = "round"; ctx.lineJoin = "round";
+    const x0 = a.x, y0 = a.y, x1 = b.x, y1 = b.y;
+    if (type === "rect") {
+      ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+    } else if (type === "ellipse") {
+      ctx.beginPath(); ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, Math.PI * 2); ctx.stroke();
+    } else if (type === "line") {
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    } else if (type === "arrow") {
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      const ang = Math.atan2(y1 - y0, x1 - x0), len = Math.max(14, this.shapeWidth * 3.2);
+      ctx.beginPath();
+      ctx.moveTo(x1, y1); ctx.lineTo(x1 - len * Math.cos(ang - Math.PI / 6), y1 - len * Math.sin(ang - Math.PI / 6));
+      ctx.moveTo(x1, y1); ctx.lineTo(x1 - len * Math.cos(ang + Math.PI / 6), y1 - len * Math.sin(ang + Math.PI / 6));
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /* ── text ───────────────────────────────────────────────────────────── */
+  openTextEditor(page, pt) {
+    this.commitText();                                   // commit any editor already open
+    const sc = (page.canvas.clientWidth || page.canvas.width) / page.canvas.width;   // display px per canvas px
+    const ta = document.createElement("textarea");
+    ta.className = "text-edit"; ta.rows = 1; ta.spellcheck = false; ta.placeholder = "Type…";
+    ta.style.left = (pt.x / page.w) * 100 + "%"; ta.style.top = (pt.y / page.h) * 100 + "%";
+    ta.style.color = this.textColor; ta.style.fontWeight = this.textBold ? "700" : "400";
+    ta.style.fontSize = this.textSize * sc + "px";
+    page._wrap.appendChild(ta);
+    this._textEdit = { page, x: pt.x, y: pt.y, el: ta, sc };
+    const autosize = () => { ta.style.width = "auto"; ta.style.height = "auto"; ta.style.width = Math.min(ta.scrollWidth + 6, page.canvas.clientWidth) + "px"; ta.style.height = ta.scrollHeight + "px"; };
+    ta.addEventListener("input", autosize);
+    ta.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();                              // don't fire tool shortcuts while typing
+      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); this.commitText(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); this.cancelText(); }
+    });
+    ta.addEventListener("blur", () => this.commitText());
+    setTimeout(() => { ta.focus(); autosize(); }, 0);
+    this.emit();
+  }
+
+  commitText() {
+    const te = this._textEdit; if (!te) return;
+    this._textEdit = null;
+    const { page, x, y, el } = te;
+    const text = el.value.replace(/[ \t]+$/gm, "").replace(/\n+$/, "");
+    el.remove();
+    if (!text.trim()) { this.emit(); return; }
+    const ctx = page.annoCtx;
+    ctx.save();
+    ctx.font = `${this.textBold ? "700" : "400"} ${this.textSize}px Inter, system-ui, sans-serif`;
+    ctx.textBaseline = "top"; ctx.fillStyle = this.textColor;
+    const lines = text.split("\n"), lineH = this.textSize * 1.25;
+    let maxW = 0; for (const ln of lines) maxW = Math.max(maxW, ctx.measureText(ln).width);
+    const ix = clamp(Math.floor(x) - 2, 0, page.w), iy = clamp(Math.floor(y) - 2, 0, page.h);
+    const iw = clamp(Math.ceil(maxW) + 8, 1, page.w - ix), ih = clamp(Math.ceil(lines.length * lineH) + 8, 1, page.h - iy);
+    const before = ctx.getImageData(ix, iy, iw, ih);
+    lines.forEach((ln, i) => ctx.fillText(ln, x, y + i * lineH));
+    const after = ctx.getImageData(ix, iy, iw, ih);
+    ctx.restore();
+    this.composite(page);
+    this.pushAnno(this.pages.indexOf(page), { x: ix, y: iy, w: iw, h: ih }, before, after);
+    this.emit();
+  }
+
+  cancelText() { const te = this._textEdit; if (!te) return; this._textEdit = null; te.el.remove(); this.emit(); }
 
   /* ── undo / redo / reset ────────────────────────────────────────────── */
   snapshotFull(page) { return { clean: cloneCanvas(page.cleanCanvas), anno: cloneCanvas(page.annoCanvas), removals: page.removals.map((r) => ({ ...r })), boxes: page.boxes.map((b) => ({ ...b })), w: page.w, h: page.h, mode: page.mode }; }
@@ -344,6 +432,137 @@ export default class Editor {
     } catch (e) { this.hideLoader(); this.toast("Reset failed", "error"); }
   }
 
+  /* ── copy / paste (select a block → ⌘C → ⌘V → click to place) ────────── */
+  setSelection(page, rect) {
+    const x = clamp(Math.floor(rect.x), 0, page.w), y = clamp(Math.floor(rect.y), 0, page.h);
+    const w = clamp(Math.ceil(rect.w), 1, page.w - x), h = clamp(Math.ceil(rect.h), 1, page.h - y);
+    this._sel = { page, x, y, w, h };
+    let box = page._selBox;
+    if (!box || !box.isConnected) { box = document.createElement("div"); box.className = "sel-box"; page._wrap.appendChild(box); page._selBox = box; }
+    box.style.left = (x / page.w) * 100 + "%"; box.style.top = (y / page.h) * 100 + "%";
+    box.style.width = (w / page.w) * 100 + "%"; box.style.height = (h / page.h) * 100 + "%";
+    box.hidden = false;
+    this.toast("Selected — ⌘/Ctrl+C to copy");
+    this.emit();
+  }
+
+  copySelection() {
+    const s = this._sel;
+    if (!s) { this.toast("Select an area first with the Copy tool"); return; }
+    const snip = newCanvas(s.w, s.h);
+    snip.getContext("2d").drawImage(s.page.canvas, s.x, s.y, s.w, s.h, 0, 0, s.w, s.h);
+    this.clipboard = { canvas: snip, w: s.w, h: s.h };
+    this.toast("Copied — ⌘/Ctrl+V to paste", "success");
+    this.emit();
+  }
+
+  startPaste() {
+    if (!this.clipboard) { this.toast("Nothing copied yet"); return; }
+    if (this.tool !== "copy") this.setTool("copy");
+    const page = this.pages[this.current]; if (!page) return;
+    if (this.pasteObj) this.commitPaste();                 // place any in-progress paste first
+    // Drop a floating copy centered in the page, shrunk to fit if it's large.
+    let w = this.clipboard.w, h = this.clipboard.h;
+    const fit = Math.min(1, (page.w * 0.9) / w, (page.h * 0.9) / h);
+    w *= fit; h *= fit;
+    this.pasteObj = { page, x: (page.w - w) / 2, y: (page.h - h) / 2, w, h };
+    this.renderPasteBox(page);
+    this.toast("Drag to move · drag a corner to resize · Enter to place");
+    this.emit();
+  }
+
+  renderPasteBox(page) {
+    const o = this.pasteObj; if (!o) return;
+    let box = page._pasteBox;
+    if (!box || !box.isConnected) {
+      box = document.createElement("div"); box.className = "paste-box";
+      const img = document.createElement("canvas"); img.className = "pb-img";
+      img.width = this.clipboard.w; img.height = this.clipboard.h;
+      img.getContext("2d").drawImage(this.clipboard.canvas, 0, 0);
+      box.appendChild(img);
+      ["nw", "ne", "se", "sw"].forEach((c) => { const hd = document.createElement("div"); hd.className = "pb-h " + c; hd.dataset.h = c; box.appendChild(hd); });
+      const bar = document.createElement("div"); bar.className = "pb-bar";
+      const ok = document.createElement("button"); ok.className = "pb-ok"; ok.textContent = "✓ Place";
+      const no = document.createElement("button"); no.className = "pb-x"; no.textContent = "✕";
+      bar.append(ok, no); box.appendChild(bar);
+      page._wrap.appendChild(box); page._pasteBox = box;
+      this._attachPasteBox(page, box, ok, no);
+    }
+    this._pasteBoxStyle(page);
+  }
+
+  _pasteBoxStyle(page) {
+    const o = this.pasteObj, b = page._pasteBox; if (!o || !b) return;
+    b.style.left = (o.x / page.w) * 100 + "%"; b.style.top = (o.y / page.h) * 100 + "%";
+    b.style.width = (o.w / page.w) * 100 + "%"; b.style.height = (o.h / page.h) * 100 + "%";
+  }
+
+  _attachPasteBox(page, box, ok, no) {
+    const canvas = page.canvas;
+    const cvScale = () => page.w / (canvas.getBoundingClientRect().width || page.w);
+    const stop = (e) => e.stopPropagation();
+    ok.addEventListener("pointerdown", stop); ok.addEventListener("click", (e) => { stop(e); this.commitPaste(); });
+    no.addEventListener("pointerdown", stop); no.addEventListener("click", (e) => { stop(e); this.cancelCopy(); });
+
+    // Drag the body → move.
+    box.addEventListener("pointerdown", (e) => {
+      if (e.target.classList.contains("pb-h") || e.target.closest(".pb-bar")) return;
+      e.stopPropagation(); box.setPointerCapture(e.pointerId);
+      const sx = e.clientX, sy = e.clientY, ox = this.pasteObj.x, oy = this.pasteObj.y, k = cvScale();
+      const move = (ev) => { this.pasteObj.x = ox + (ev.clientX - sx) * k; this.pasteObj.y = oy + (ev.clientY - sy) * k; this._pasteBoxStyle(page); };
+      const up = () => { box.removeEventListener("pointermove", move); box.removeEventListener("pointerup", up); };
+      box.addEventListener("pointermove", move); box.addEventListener("pointerup", up);
+    });
+
+    // Drag a corner → resize (keeps the copy's aspect ratio, anchored at the opposite corner).
+    box.querySelectorAll(".pb-h").forEach((hd) => {
+      hd.addEventListener("pointerdown", (e) => {
+        e.stopPropagation(); hd.setPointerCapture(e.pointerId);
+        const o = this.pasteObj, c = hd.dataset.h;
+        const [ax, ay] = { nw: [o.x + o.w, o.y + o.h], ne: [o.x, o.y + o.h], se: [o.x, o.y], sw: [o.x + o.w, o.y] }[c];
+        const cw = this.clipboard.w, ch = this.clipboard.h, minS = Math.max(16 / cw, 16 / ch);
+        const move = (ev) => {
+          const p = this.canvasPoint(canvas, ev);
+          const s = Math.max(Math.abs(p.x - ax) / cw, Math.abs(p.y - ay) / ch, minS);
+          o.w = cw * s; o.h = ch * s;
+          o.x = p.x >= ax ? ax : ax - o.w;
+          o.y = p.y >= ay ? ay : ay - o.h;
+          this._pasteBoxStyle(page);
+        };
+        const up = () => { hd.removeEventListener("pointermove", move); hd.removeEventListener("pointerup", up); };
+        hd.addEventListener("pointermove", move); hd.addEventListener("pointerup", up);
+      });
+    });
+  }
+
+  commitPaste() {
+    const o = this.pasteObj; if (!o) return;
+    const page = o.page;
+    const ix = clamp(Math.floor(o.x), 0, page.w), iy = clamp(Math.floor(o.y), 0, page.h);
+    const iw = clamp(Math.ceil(o.x + o.w), 0, page.w) - ix, ih = clamp(Math.ceil(o.y + o.h), 0, page.h) - iy;
+    if (page._pasteBox) { page._pasteBox.remove(); page._pasteBox = null; }
+    this.pasteObj = null;
+    if (iw <= 0 || ih <= 0) { this.emit(); return; }        // dragged fully off the page
+    const before = page.annoCtx.getImageData(ix, iy, iw, ih);
+    page.annoCtx.drawImage(this.clipboard.canvas, 0, 0, this.clipboard.w, this.clipboard.h, o.x, o.y, o.w, o.h);
+    const after = page.annoCtx.getImageData(ix, iy, iw, ih);
+    this.composite(page);
+    this.pushAnno(this.pages.indexOf(page), { x: ix, y: iy, w: iw, h: ih }, before, after);   // undoable
+    this.toast("Placed", "success");
+  }
+
+  cancelCopy() {
+    if (!this.pasteObj && !this._sel) return;
+    this._sel = null;
+    if (this.pasteObj) {
+      if (this.pasteObj.page._pasteBox) { this.pasteObj.page._pasteBox.remove(); this.pasteObj.page._pasteBox = null; }
+      this.pasteObj = null;
+    }
+    const page = this.pages[this.current];
+    if (page?._selBox) page._selBox.hidden = true;
+    this.emit();
+  }
+
   /* ── pointer tools ──────────────────────────────────────────────────── */
   canvasPoint(canvas, e) { const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) * (canvas.width / r.width), y: (e.clientY - r.top) * (canvas.height / r.height) }; }
   attachCanvasTools(page) {
@@ -379,6 +598,12 @@ export default class Editor {
         wrap.style.cursor = "grabbing"; if (cur) cur.hidden = true; e.preventDefault(); return;
       }
       const p = this.canvasPoint(canvas, e);
+      // Copy tool: while a paste is floating, clicking off it places (commits) it.
+      if (this.tool === "copy" && this.pasteObj) {
+        this.commitPaste(); e.preventDefault(); return;
+      }
+      // Text tool: a click drops a text box you type into.
+      if (this.tool === "text") { this.openTextEditor(page, p); e.preventDefault(); return; }
       if (this.tool === "brush") {
         mode = "brush"; canvas.setPointerCapture(e.pointerId);
         drag = p; bbox = null; expand(p); snap = cloneCanvas(page.annoCanvas);
@@ -392,6 +617,15 @@ export default class Editor {
       } else if (this.tool === "cover") {
         mode = "cover"; canvas.setPointerCapture(e.pointerId);
         drag = p; marquee = document.createElement("div"); marquee.className = "marquee"; wrap.appendChild(marquee);
+      } else if (this.tool === "copy") {
+        mode = "copy"; canvas.setPointerCapture(e.pointerId);
+        drag = p; marquee = document.createElement("div"); marquee.className = "marquee"; wrap.appendChild(marquee);
+        if (page._selBox) page._selBox.hidden = true;   // starting a fresh selection
+      } else if (this.tool === "shape") {
+        mode = "shape"; canvas.setPointerCapture(e.pointerId);
+        drag = p; snap = cloneCanvas(page.annoCanvas);
+        const sc = newCanvas(page.w, page.h);
+        this._stroke = { canvas: sc, opacity: 1 }; this._strokePage = page; this._strokeCtx = sc.getContext("2d");
       }
     });
 
@@ -400,6 +634,7 @@ export default class Editor {
       if (!drag) return;
       const p = this.canvasPoint(canvas, e);
       if (mode === "brush") { expand(p); this._strokeCtx.lineTo(p.x, p.y); this._strokeCtx.stroke(); this.composite(page); }
+      else if (mode === "shape") { this._strokeCtx.clearRect(0, 0, page.w, page.h); this.drawShape(this._strokeCtx, this.shapeType, drag, p); this.composite(page); }
       else if (marquee) {
         const x = Math.min(drag.x, p.x), y = Math.min(drag.y, p.y), w = Math.abs(p.x - drag.x), h = Math.abs(p.y - drag.y);
         marquee.style.left = (x / page.w) * 100 + "%"; marquee.style.top = (y / page.h) * 100 + "%";
@@ -422,6 +657,17 @@ export default class Editor {
         if (marquee) { marquee.remove(); marquee = null; }
         const rect = { x: Math.min(start.x, p.x), y: Math.min(start.y, p.y), w: Math.abs(p.x - start.x), h: Math.abs(p.y - start.y) };
         if (rect.w > 3 && rect.h > 3) { this.addRemoval(page, rect, {}); this.toast("Removed", "success"); }
+      } else if (mode === "copy") {
+        if (marquee) { marquee.remove(); marquee = null; }
+        const rect = { x: Math.min(start.x, p.x), y: Math.min(start.y, p.y), w: Math.abs(p.x - start.x), h: Math.abs(p.y - start.y) };
+        if (rect.w > 4 && rect.h > 4) this.setSelection(page, rect);
+      } else if (mode === "shape") {
+        page.annoCtx.drawImage(this._stroke.canvas, 0, 0);
+        this._stroke = null; this._strokePage = null; this._strokeCtx = null;
+        this.composite(page);
+        const bbox = { x0: Math.min(start.x, p.x), y0: Math.min(start.y, p.y), x1: Math.max(start.x, p.x), y1: Math.max(start.y, p.y) };
+        if (bbox.x1 - bbox.x0 > 2 || bbox.y1 - bbox.y0 > 2) this.commitStroke(page, snap, bbox, this.shapeWidth * 2 + 16);   // wide margin covers arrowheads
+        snap = null;
       }
       mode = null;
     });
@@ -474,7 +720,7 @@ export default class Editor {
   }
 
   /* ── tool + control setters (called by React) ───────────────────────── */
-  setTool(tool) { this.tool = tool; const page = this.pages[this.current]; if (page?._wrap) page._wrap.className = "canvas-wrap tool-" + tool; if (page?._brushCursor) page._brushCursor.hidden = true; this.emit(); }
+  setTool(tool) { if (tool !== "copy") { if (this.pasteObj) this.commitPaste(); this.cancelCopy(); } if (tool !== "text" && this._textEdit) this.commitText(); this.tool = tool; const page = this.pages[this.current]; if (page?._wrap) page._wrap.className = "canvas-wrap tool-" + tool; if (page?._brushCursor) page._brushCursor.hidden = true; this.emit(); }
   setFillMode(mode) { this.fillMode = mode; this.emit(); }
   setFixedColor(hex) { this.fixedColor = hex; if (this.fillMode === "auto") this.fillMode = "fixed"; this.emit(); }
   setBrushColor(hex) { this.brushColor = hex; const c = this.pages[this.current]?._brushCursor; if (c) c.style.borderColor = hex; this.emit(); }
@@ -485,7 +731,21 @@ export default class Editor {
     this.emit();
   }
   setBrushOpacity(o) { this.brushOpacity = Math.max(0.05, Math.min(1, +o)); this.emit(); }
-  applyPicked(hex, target) { if (target === "fill") this.setFixedColor(hex); else this.setBrushColor(hex); this.toast("Picked " + hex.toUpperCase()); }
+  applyPicked(hex, target) {
+    if (target === "fill") this.setFixedColor(hex);
+    else if (target === "text") this.setTextColor(hex);
+    else if (target === "shape") this.setShapeColor(hex);
+    else this.setBrushColor(hex);
+    this.toast("Picked " + hex.toUpperCase());
+  }
+
+  /* ── text / shape setters (called by React) ─────────────────────────── */
+  setTextColor(hex) { this.textColor = hex; if (this._textEdit) this._textEdit.el.style.color = hex; this.emit(); }
+  setTextSize(n) { this.textSize = +n; if (this._textEdit) this._textEdit.el.style.fontSize = this.textSize * this._textEdit.sc + "px"; this.emit(); }
+  setTextBold(b) { this.textBold = !!b; if (this._textEdit) this._textEdit.el.style.fontWeight = this.textBold ? "700" : "400"; this.emit(); }
+  setShapeType(t) { this.shapeType = t; this.emit(); }
+  setShapeColor(hex) { this.shapeColor = hex; this.emit(); }
+  setShapeWidth(n) { this.shapeWidth = +n; this.emit(); }
   async startPick(target = "brush") {
     if (window.EyeDropper) {                              // native screen eyedropper (Chrome/Edge)
       try { const r = await new window.EyeDropper().open(); if (r && r.sRGBHex) this.applyPicked(r.sRGBHex, target); }
