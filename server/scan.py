@@ -1,9 +1,10 @@
 """
-Image-processing engine (OpenCV + Pillow) backing the seamless number removal.
+Image-processing engine (OpenCV + Pillow) backing seamless text removal.
 
 Pure functions over PNG bytes so the API layer stays thin:
-  - inpaint()             remove rectangles (flat background fill or reconstruction)
-  - preprocess_for_ocr()  clean an image so Tesseract reads numbers more reliably
+  - erase()               remove rectangles (flat fill or inpaint reconstruction)
+  - preprocess_for_ocr()  clean an image so Tesseract reads text more reliably
+  - sample_ink_color()    guess the text (foreground) color inside a rect
 """
 from __future__ import annotations
 
@@ -31,6 +32,64 @@ def _to_png(cv_img: np.ndarray) -> bytes:
 
 
 # ── Seamless removal ────────────────────────────────────────────────────────
+def _redraw_rules(img, x0, y0, x1, y1, reach: int = 4):
+    """Table lines crossing an erased rect get filled over and vanish, leaving a
+    telltale gap in the grid. Detect straight rules entering the rect from its
+    borders and paint them back across the gap in their own ink color.
+
+    A horizontal rule enters at the same row from BOTH the left and right
+    borders; a vertical rule enters at the same column from top and bottom.
+    Requiring both sides avoids mistaking glyph strokes for rules."""
+    h, w = img.shape[:2]
+    lum = img.astype(np.int32).sum(axis=2)
+    bg = float(np.median(lum))
+    dark = bg - 150                                        # clearly-ink threshold
+    lx, rx = max(0, x0 - reach), min(w - 1, x1 + reach - 1)
+    ty, by = max(0, y0 - reach), min(h - 1, y1 + reach - 1)
+    # horizontal rules
+    for yy in range(y0, y1):
+        if lum[yy, lx] < dark and lum[yy, rx] < dark:
+            color = img[yy, lx] if lum[yy, lx] <= lum[yy, rx] else img[yy, rx]
+            img[yy, x0:x1] = color
+    # vertical rules
+    for xx in range(x0, x1):
+        if lum[ty, xx] < dark and lum[by, xx] < dark:
+            color = img[ty, xx] if lum[ty, xx] <= lum[by, xx] else img[by, xx]
+            img[y0:y1, xx] = color
+
+
+def _grain(img, x0, y0, x1, y1, pad: int = 16) -> float:
+    """High-frequency noise level of the background around a rect (paper grain,
+    JPEG noise). Measured as the residual after a small blur, so gradients and
+    edges don't inflate it. A filled patch with zero grain stands out as an
+    obvious clean rectangle on a noisy scan — the fill must get matching noise."""
+    h, w = img.shape[:2]
+    ex0, ey0 = max(0, x0 - pad), max(0, y0 - pad)
+    ex1, ey1 = min(w, x1 + pad), min(h, y1 + pad)
+    region = img[ey0:ey1, ex0:ex1].astype(np.float32)
+    if region.size < 300:
+        return 0.0
+    resid = region - cv2.blur(region, (3, 3))
+    # measure on background pixels only, and stay ≥2px away from any ink:
+    # the 3px blur smears glyph edges into adjacent background pixels, which
+    # inflated the estimate and left visible speckle behind edits on clean docs
+    lum = region.sum(axis=2)
+    bg = (np.abs(lum - np.median(lum)) < 90).astype(np.uint8)
+    bg = cv2.erode(bg, np.ones((5, 5), np.uint8))
+    mask = bg > 0
+    if mask.sum() < 100:
+        return 0.0
+    return float(np.clip(resid[mask].std() * 1.2, 0.0, 9.0))
+
+
+def _add_grain(img, x0, y0, x1, y1, std: float):
+    if std < 2.0:
+        return                     # clean paper stays perfectly clean
+    region = img[y0:y1, x0:x1].astype(np.float32)
+    # luminance-only noise: paper grain is monochrome — independent per-channel
+    # noise reads as colored speckle and gives the patch away under zoom
+    region += np.random.normal(0.0, std * 0.8, region.shape[:2])[..., None]
+    img[y0:y1, x0:x1] = np.clip(region, 0, 255).astype(np.uint8)
 def _ring_fill(img, x0, y0, x1, y1):
     """Inspect the band of pixels just outside the rect. If that background is
     fairly uniform, return (fill_color, fraction_uniform); else fraction is low."""
@@ -51,25 +110,48 @@ def _ring_fill(img, x0, y0, x1, y1):
     dom = colors[counts.argmax()]
     close = np.abs(px - dom).sum(axis=1) < 36
     frac = float(close.mean())
-    fill = px[close].mean(axis=0) if close.any() else dom
+    # median, not mean: antialias remnants in the ring pull a mean slightly
+    # darker, leaving a faint gray patch on white paper
+    fill = np.median(px[close], axis=0) if close.any() else dom
     return fill, frac
 
 
-def inpaint(png_bytes: bytes, rects: list, dilate: int = 3, radius: int = 4,
-            flat_threshold: float = 0.7, fixed_rgb: tuple | None = None) -> bytes:
-    """Remove each rect.
+def _interp_fill(img, x0, y0, x1, y1, band: int = 8) -> bool:
+    """Crisp reconstruction for non-uniform backgrounds: each row is linearly
+    interpolated between the pixels just left and right of the rect. Gradients
+    and paper tone are preserved with zero blur (unlike inpainting, which
+    smudges). Returns False when the rect spans the full image width.
+
+    Per-row MEDIAN over a wide band, so a thin table rule or scan shadow next
+    to the rect can't drag whole rows dark (which showed up as black smears)."""
+    h, w = img.shape[:2]
+    left = img[y0:y1, max(0, x0 - band):x0].astype(np.float32)
+    right = img[y0:y1, x1:min(w, x1 + band)].astype(np.float32)
+    if left.size == 0 and right.size == 0:
+        return False
+    if left.size == 0:
+        left = right
+    if right.size == 0:
+        right = left
+    lcol = np.median(left, axis=1)                          # (rows, 3)
+    rcol = np.median(right, axis=1)
+    t = np.linspace(0.0, 1.0, x1 - x0, dtype=np.float32)[None, :, None]
+    img[y0:y1, x0:x1] = (lcol[:, None, :] * (1 - t) + rcol[:, None, :] * t).astype(np.uint8)
+    return True
+
+
+def erase(png_bytes: bytes, rects: list, dilate: int = 3,
+          flat_threshold: float = 0.7, fixed_rgb: tuple | None = None) -> bytes:
+    """Remove each rect, rebuilding the background behind it — never blurred.
 
     When ``fixed_rgb`` is given (r, g, b), every rect is painted with that exact
-    color — this backs the UI's "Fixed" fill mode and the eyedropper, so the
-    user's chosen color actually persists in the result.
-
-    Otherwise ("auto"): where the surrounding background is uniform (e.g. a white
-    scan), fill it with that clean background color — no blur. Only where the
-    background is textured/varied do we reconstruct it with inpainting.
+    color. Otherwise ("auto"): where the surrounding background is uniform (e.g.
+    a white page), fill with that clean background color; where it isn't,
+    reconstruct it by interpolating the surrounding pixels row by row. No
+    inpainting — inpainting leaves a smudged/blurry patch behind edits.
     """
     img = _to_cv(png_bytes)
     h, w = img.shape[:2]
-    mask = np.zeros((h, w), np.uint8)
     fixed_bgr = None
     if fixed_rgb is not None:
         r, g, b = (int(v) for v in fixed_rgb)
@@ -88,19 +170,130 @@ def inpaint(png_bytes: bytes, rects: list, dilate: int = 3, radius: int = 4,
         if fixed_bgr is not None:
             img[y0:y1, x0:x1] = fixed_bgr                    # exact user-chosen color
             continue
+        grain = _grain(img, x0, y0, x1, y1)
         fill, frac = _ring_fill(img, x0, y0, x1, y1)
         if frac >= flat_threshold:
-            img[y0:y1, x0:x1] = fill.astype(np.uint8)      # clean flat background, no blur
-        else:
-            mask[y0:y1, x0:x1] = 255                        # textured → reconstruct
+            img[y0:y1, x0:x1] = fill.astype(np.uint8)       # clean flat background
+        elif not _interp_fill(img, x0, y0, x1, y1):
+            img[y0:y1, x0:x1] = fill.astype(np.uint8)
+        _redraw_rules(img, x0, y0, x1, y1)                  # keep table grid intact
+        _add_grain(img, x0, y0, x1, y1, grain)              # blend into the paper texture
     if not touched:
         return png_bytes
-    if mask.any():
-        img = cv2.inpaint(img, mask, radius, cv2.INPAINT_TELEA)
     return _to_png(img)
 
 
-# ── OCR preprocessing ───────────────────────────────────────────────────────
+def erase_object(png_bytes: bytes, rect: dict, grow: int = 24) -> bytes:
+    """Phone-gallery-style object removal. The user's rectangle SEEDS the
+    selection: every ink stroke touching it (including parts that spill a
+    little outside the rectangle) is masked, and ONLY those pixels are
+    inpainted — the background in between is left untouched, so there is no
+    filled-patch outline at all. Matched grain is added over the healed
+    strokes. Falls back to a plain rect erase when the area holds no ink."""
+    img = _to_cv(png_bytes)
+    h, w = img.shape[:2]
+    try:
+        x, y, rw, rh = float(rect["x"]), float(rect["y"]), float(rect["w"]), float(rect["h"])
+    except (KeyError, TypeError, ValueError):
+        return png_bytes
+    x0, y0 = max(0, int(x)), max(0, int(y))
+    x1, y1 = min(w, int(x + rw)), min(h, int(y + rh))
+    if x1 <= x0 or y1 <= y0:
+        return png_bytes
+    wx0, wy0 = max(0, x0 - grow), max(0, y0 - grow)
+    wx1, wy1 = min(w, x1 + grow), min(h, y1 + grow)
+    window = img[wy0:wy1, wx0:wx1]
+    lum = window.astype(np.int32).sum(axis=2)
+    # Sensitive threshold: soft scans (CamScanner) leave pale antialiased stroke
+    # edges far above the dark core — a strict cut heals only the core and a
+    # ghost outline survives.
+    ink = (lum < np.median(lum) - 60).astype(np.uint8)
+    n_labels, labels = cv2.connectedComponents(ink)
+    seed = np.unique(labels[y0 - wy0:y1 - wy0, x0 - wx0:x1 - wx0])
+    seed = seed[seed != 0]
+    if len(seed) == 0:                                     # no ink → plain fill
+        return erase(png_bytes, [rect])
+    mask = np.isin(labels, seed).astype(np.uint8)
+    # wide dilation swallows the faint antialias halo around each stroke
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=3)
+    # …and a zone pass catches DISCONNECTED pale remnants near the strokes
+    # (sharpening halos, JPEG dust) that sit above the ink threshold. Truly
+    # dark pixels (real content like table rules) are excluded.
+    bg_lum = float(np.median(lum))
+    zone = cv2.dilate(mask, np.ones((13, 13), np.uint8)) > 0
+    halo = zone & (mask == 0) & (lum < bg_lum - 10) & (lum > bg_lum - 220)
+    mask = (mask | halo).astype(np.uint8)
+    # Fill the mask from CLEAN background only. Inpainting interpolates from
+    # the mask boundary — where pale halo remnants live — which tinted the
+    # healed area with a ghost of the stroke. Instead, sample per-row medians
+    # of pixels far enough from any stroke (outside an extra exclusion band).
+    exclusion = cv2.dilate(mask, np.ones((9, 9), np.uint8))
+    bg_ok = exclusion == 0
+    glob = (np.median(window[bg_ok], axis=0) if bg_ok.any()
+            else np.array([255.0, 255.0, 255.0]))
+    healed = window.copy()
+    for row in np.unique(np.where(mask > 0)[0]):
+        bgpx = window[row][bg_ok[row]]
+        fill = np.median(bgpx, axis=0) if len(bgpx) >= 8 else glob
+        healed[row][mask[row] > 0] = fill.astype(np.uint8)
+    grain = _grain(img, x0, y0, x1, y1)
+    if grain >= 2.0:                                       # re-grain the healed strokes
+        noise = np.random.normal(0.0, grain * 0.8, healed.shape[:2])[..., None]
+        noisy = np.clip(healed.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        healed = np.where(mask[..., None] > 0, noisy, healed)
+    img[wy0:wy1, wx0:wx1] = healed
+    _redraw_rules(img, x0, y0, x1, y1)                     # keep table grid intact
+    return _to_png(img)
+
+
+# ── OCR support ─────────────────────────────────────────────────────────────
+def _ink_mask(region: np.ndarray):
+    """Binary ink mask for a word region. The background reference comes from
+    a high percentile (NOT the median — in a tight word box the glyphs can
+    dominate, which made a median-based threshold keep only the darkest core
+    and halve the measured glyph height on low-contrast scans). The threshold
+    then sits a quarter of the way from background to the darkest pixel, so
+    antialiased glyph edges still count as ink. Returns None when the region
+    has no meaningful contrast."""
+    lum = region.astype(np.int32).sum(axis=2)              # 0 … 765
+    bg = float(np.percentile(lum, 90))
+    lo = float(lum.min())
+    if bg - lo < 150:
+        return None
+    return (lum < bg - 0.25 * (bg - lo)).astype(np.uint8)
+
+
+def tighten_box(img: np.ndarray, rect: tuple, margin: int = 3) -> tuple:
+    """Shrink an OCR word rect to the tight bbox of its ink pixels.
+
+    Tesseract sometimes returns a whole-cell box for an isolated word, which
+    wrecks any size estimate derived from the box. The ink bbox restores the
+    true glyph extent. A small inner margin is ignored so cell border lines
+    touching the box edges don't count as ink. Returns the rect unchanged when
+    no ink is found."""
+    x0, y0, x1, y1 = (int(v) for v in rect)
+    h, w = img.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0); x1, y1 = min(w, x1), min(h, y1)
+    # margin scales with the box — a fixed 3px eats half of a small word's
+    # height on low-resolution scans
+    mx = max(1, min(margin, (x1 - x0) // 8))
+    my = max(1, min(margin, (y1 - y0) // 8))
+    if x1 - x0 <= 2 * mx or y1 - y0 <= 2 * my:
+        return (x0, y0, x1, y1)
+    ink = _ink_mask(img[y0 + my:y1 - my, x0 + mx:x1 - mx])
+    if ink is None:
+        return (x0, y0, x1, y1)
+    rows = np.where(ink.any(axis=1))[0]
+    cols = np.where(ink.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return (x0, y0, x1, y1)
+    rh, rw = ink.shape
+    # ink touching the shaved edge continues into the margin — restore that side
+    tx0 = x0 if cols[0] == 0 else x0 + mx + int(cols[0])
+    ty0 = y0 if rows[0] == 0 else y0 + my + int(rows[0])
+    tx1 = x1 if cols[-1] == rw - 1 else x0 + mx + int(cols[-1]) + 1
+    ty1 = y1 if rows[-1] == rh - 1 else y0 + my + int(rows[-1]) + 1
+    return (tx0, ty0, tx1, ty1)
 def preprocess_for_ocr(png_bytes: bytes):
     """Grayscale + upscale + denoise + Otsu threshold → crisp input for Tesseract.
 
@@ -110,9 +303,52 @@ def preprocess_for_ocr(png_bytes: bytes):
     img = _to_cv(png_bytes)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     up = 1.0
-    if gray.shape[1] < 1600:  # upscale small scans so digits are legible
+    if gray.shape[1] < 1600:  # upscale small scans so glyphs are legible
         up = 1600 / gray.shape[1]
         gray = cv2.resize(gray, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
     gray = cv2.fastNlMeansDenoising(gray, h=10)
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
     return Image.fromarray(thr), up
+
+
+def stroke_width(img: np.ndarray, rect: tuple) -> float:
+    """Median stroke thickness (px) of the ink inside a rect, via the distance
+    transform. Lets the OCR path tell bold text from regular: bold strokes run
+    ~0.14 em wide vs ~0.09 em for regular weights."""
+    x0, y0, x1, y1 = (int(v) for v in rect)
+    h, w = img.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0); x1, y1 = min(w, x1), min(h, y1)
+    region = img[y0:y1, x0:x1]
+    if region.size == 0:
+        return 0.0
+    ink = _ink_mask(region)
+    if ink is None or ink.sum() < 8:
+        return 0.0
+    dist = cv2.distanceTransform(ink, cv2.DIST_L2, 3)
+    vals = dist[dist > 0]
+    if len(vals) == 0:
+        return 0.0
+    return float(2.0 * np.percentile(vals, 75))
+
+
+def sample_ink_color(img: np.ndarray, rect: tuple) -> tuple:
+    """Ink (foreground) color inside a rect: the median of the darkest ~12% of
+    pixels. On real scans, antialiased glyph edges and JPEG noise form a pale
+    halo that can outnumber the ink core — picking the 'most common
+    non-background cluster' returns that washed-out halo tone, so replacements
+    rendered nearly invisible. The darkest-percentile core is what the eye
+    actually reads as the text color. Returns (r, g, b)."""
+    x0, y0, x1, y1 = (int(v) for v in rect)
+    h, w = img.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0); x1, y1 = min(w, x1), min(h, y1)
+    region = img[y0:y1, x0:x1]
+    if region.size == 0:
+        return (0, 0, 0)
+    px = region.reshape(-1, 3).astype(np.int32)
+    lum = px.sum(axis=1)                                   # 0 … 765
+    darkest = np.percentile(lum, 2)                        # robust minimum
+    ink = px[lum <= darkest + 90]                          # ± ~30 per channel around it
+    if len(ink) == 0:
+        ink = px
+    b, g, r = np.median(ink, axis=0)
+    return (int(r), int(g), int(b))

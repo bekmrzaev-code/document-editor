@@ -5,5 +5,10 @@ dist
 
 # Python backend
 server/.venv
+server/venv
+.env
 __pycache__/
 *.pyc
+
+# Support inbox (user problem reports)
+server/support/

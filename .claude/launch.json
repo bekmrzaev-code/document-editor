@@ -2,11 +2,18 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "bol-editor",
-      "runtimeExecutable": "server/.venv/bin/uvicorn",
-      "runtimeArgs": ["app:app", "--app-dir", "server", "--host", "127.0.0.1", "--port", "8000"],
-      "cwd": "/Users/abdurahmon/Documents/coding/projects/bol-editor",
+      "name": "api",
+      "runtimeExecutable": "server/venv/bin/uvicorn",
+      "runtimeArgs": ["app:app", "--app-dir", "server", "--host", "127.0.0.1", "--port", "8000", "--reload", "--reload-dir", "server"],
+      "cwd": "/Users/abdurahmon/Desktop/Projects/work/bol-editor",
       "port": 8000
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "/Users/abdurahmon/Desktop/Projects/work/bol-editor/web",
+      "port": 5173
     }
   ]
 }
