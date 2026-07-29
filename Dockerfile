@@ -10,8 +10,19 @@ RUN npm run build
 FROM python:3.11-slim
 
 # System libraries: Tesseract (OCR) and the libs OpenCV/Pillow need at runtime.
+# The language packs matter — without them Tesseract reads every scan as
+# English, which mangles Cyrillic and the Uzbek oʻ/gʻ digraphs. DejaVu gives
+# /api/digitize a Unicode face so those characters survive into the new PDF.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tesseract-ocr \
+      tesseract-ocr-uzb \
+      tesseract-ocr-uzb-cyrl \
+      tesseract-ocr-rus \
+      tesseract-ocr-tur \
+      tesseract-ocr-deu \
+      tesseract-ocr-fra \
+      tesseract-ocr-spa \
+      fonts-dejavu-core \
       libglib2.0-0 \
       libgl1 \
   && rm -rf /var/lib/apt/lists/*

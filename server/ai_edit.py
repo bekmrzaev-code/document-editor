@@ -29,7 +29,15 @@ _client = None
 
 
 def available() -> bool:
-    return bool(os.environ.get("GEMINI_API_KEY"))
+    """Whether the AI features can actually run — a key alone isn't enough, the
+    SDK has to be installed too, or the UI advertises features that only 500."""
+    if not os.environ.get("GEMINI_API_KEY"):
+        return False
+    try:
+        import google.genai  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _get_client():
@@ -38,7 +46,14 @@ def _get_client():
     if not key:
         raise AiUnavailable("GEMINI_API_KEY is not set on the server.")
     if _client is None:
-        from google import genai
+        try:
+            from google import genai
+        except ImportError:
+            # a key without the SDK is still "AI off" — report it as such, so
+            # the UI says so instead of showing an opaque 500 on every call
+            raise AiUnavailable(
+                "The google-genai package isn't installed on the server "
+                "(pip install -r server/requirements.txt).")
         _client = genai.Client(api_key=key)
     return _client
 

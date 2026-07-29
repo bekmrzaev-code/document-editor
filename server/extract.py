@@ -7,6 +7,8 @@ Coordinates are in PDF points; the API layer scales them to render pixels.
 """
 from __future__ import annotations
 
+import fitz
+
 
 def _family(font: str) -> str:
     """Coarse family hint so the canvas can pick a similar web-safe font."""
@@ -18,11 +20,26 @@ def _family(font: str) -> str:
     return "sans"
 
 
+def _rotated(bbox, origin, mat):
+    """Map one glyph from unrotated page space into the rotated page space.
+
+    Text extraction always reports coordinates on the UNROTATED page, while
+    ``page.rect`` — and therefore the pixmap the user sees — follows the
+    rotation. Without this mapping every box on a rotated page lands somewhere
+    else entirely.
+    """
+    r = fitz.Rect(bbox) * mat
+    r.normalize()
+    p = fitz.Point(origin) * mat if origin else None
+    return (r.x0, r.y0, r.x1, r.y1), ((p.x, p.y) if p else None)
+
+
 def extract_text_runs(page) -> list[dict]:
     """Group each span's chars into whitespace-separated words. Bounds come from
     the union of the real glyph boxes (so descenders g/y/p aren't clipped), the
     baseline from the first glyph's origin. Returns [] on image-only pages."""
     runs = []
+    mat = page.rotation_matrix if page.rotation else None
     raw = page.get_text("rawdict")
     for bi, block in enumerate(raw.get("blocks", [])):
         for li, line in enumerate(block.get("lines", [])):
@@ -50,6 +67,8 @@ def extract_text_runs(page) -> list[dict]:
                         cur = None
                         continue
                     org = ch.get("origin")
+                    if mat is not None:
+                        bb, org = _rotated(bb, org, mat)
                     if cur is None:
                         cur = {"text": "", "rect": list(bb),
                                "base": org[1] if org else bb[3], **style}

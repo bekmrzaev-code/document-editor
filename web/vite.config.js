@@ -10,4 +10,7 @@ export default defineConfig({
     proxy: { "/api": "http://localhost:8000" },
   },
   build: { outDir: "dist", emptyOutDir: true },
+  // jsdom for localStorage/document in the engine's constructor; the tests
+  // themselves stay clear of canvas, so no canvas backend is needed.
+  test: { environment: "jsdom", include: ["src/**/*.test.js"] },
 });

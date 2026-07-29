@@ -20,6 +20,7 @@ import json
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from PIL import Image as PILImage
 import notify
 import scan
 from extract import extract_text_runs
+from store import SessionStore
 
 
 def _load_env(path: Path):
@@ -61,6 +63,28 @@ except Exception:
     HAS_OCR = False
 
 
+def _ocr_languages() -> list[str]:
+    """Language packs installed alongside Tesseract ("eng", "rus", "uzb", …).
+
+    Without a language the engine assumes English, which reads Cyrillic and the
+    Uzbek o'/g' digraphs badly — the UI offers this list so the user can pick.
+    """
+    if not HAS_OCR:
+        return []
+    # osd/snum/equ are helper models (orientation, serial numbers, equations),
+    # not languages — offering them in the picker would just confuse.
+    helpers = {"osd", "snum", "equ"}
+    try:
+        langs = [x for x in pytesseract.get_languages(config="") if x not in helpers]
+    except Exception:
+        return ["eng"]
+    return sorted(langs) or ["eng"]
+
+
+OCR_LANGS = _ocr_languages()
+DEFAULT_OCR_LANG = os.environ.get("OCR_LANG", "eng")
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -73,13 +97,20 @@ RENDER_SCALE = 2.0                                     # PDF points → pixels
 MAX_DIM = 2200                                         # cap longest page side (px)
 THUMB_WIDTH = 220
 SESSION_TTL = _env_int("SESSION_TTL", 3600)            # idle session lifetime (s)
+# Tesseract runs as a subprocess and OpenCV releases the GIL, so scanned pages
+# OCR in parallel. Capped low — each worker holds a full page image in memory.
+OCR_WORKERS = _env_int("OCR_WORKERS", min(4, os.cpu_count() or 2))
 
 # ── Abuse guards (keep the app open to everyone — these only stop DoS) ───────
 MAX_UPLOAD_BYTES = _env_int("MAX_UPLOAD_BYTES", 30 * 1024 * 1024)
 MAX_PAGES = _env_int("MAX_PAGES", 60)
 PILImage.MAX_IMAGE_PIXELS = _env_int("MAX_IMAGE_PIXELS", 40_000_000)
 
-SESSIONS: dict[str, dict] = {}
+STORE = SessionStore(
+    root=Path(os.environ.get("SESSION_DIR", str(Path(__file__).resolve().parent / "sessions"))),
+    ttl=SESSION_TTL,
+    persist=os.environ.get("SESSION_PERSIST", "1") not in ("0", "false", "no"),
+)
 
 app = FastAPI(title="DocEdit API")
 
@@ -101,6 +132,7 @@ RATE_LIMITS = {                                        # path → (max requests,
     "/api/ai-ocr": (_env_int("RL_AI", 15), 60),
     "/api/ai-fonts": (_env_int("RL_AI", 15), 60),
     "/api/digitize": (_env_int("RL_DIGITIZE", 10), 60),
+    "/api/rotate": (_env_int("RL_ROTATE", 60), 60),
     "/api/support": (_env_int("RL_SUPPORT", 6), 60),
 }
 _hits: dict[tuple, list] = {}
@@ -136,20 +168,10 @@ async def rate_limit(request, call_next):
 
 
 # ── Sessions ─────────────────────────────────────────────────────────────────
-def cleanup_sessions():
-    now = time.time()
-    for k in [k for k, v in SESSIONS.items() if now - v["created"] > SESSION_TTL]:
-        SESSIONS.pop(k, None)
-    if len(SESSIONS) > 30:
-        for k in sorted(SESSIONS, key=lambda k: SESSIONS[k]["created"])[:-30]:
-            SESSIONS.pop(k, None)
-
-
 def _get_session(sid: str) -> dict:
-    sess = SESSIONS.get(sid)
+    sess = STORE.get(sid)
     if not sess:
         raise HTTPException(404, "Session expired — please re-upload.")
-    sess["created"] = time.time()
     return sess
 
 
@@ -168,7 +190,8 @@ def _open_document(data: bytes, filename: str, content_type: str):
 
 # ── /api/analyze ─────────────────────────────────────────────────────────────
 @app.post("/api/analyze")
-async def analyze(file: UploadFile = File(...)):
+async def analyze(file: UploadFile = File(...), lang: str = Form("")):
+    lang = _clean_lang(lang)
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty file")
@@ -189,53 +212,168 @@ async def analyze(file: UploadFile = File(...)):
         raise HTTPException(413, f"Too many pages ({n_pages}); the limit is {MAX_PAGES}.")
 
     sid = uuid.uuid4().hex
+    # Rasterize serially — a fitz.Document must not be touched from two threads.
+    try:
+        rendered = [_render_page(doc[p]) for p in range(n_pages)]
+        rotations = [doc[p].rotation for p in range(n_pages)]
+    finally:
+        doc.close()
+
+    # …then OCR the scanned pages concurrently. Tesseract runs as a subprocess
+    # and OpenCV releases the GIL, so on a multi-page scan this is the whole
+    # difference between waiting once and waiting once per page.
+    scans = [i for i, r in enumerate(rendered) if r["scanned"]] if HAS_OCR else []
+    ocr_by_page: dict[int, tuple] = {}
+    if len(scans) > 1:
+        with ThreadPoolExecutor(max_workers=min(OCR_WORKERS, len(scans))) as pool:
+            futures = {i: pool.submit(_ocr_page, rendered[i]["png"], rendered[i]["scale"], lang)
+                       for i in scans}
+            ocr_by_page = {i: f.result() for i, f in futures.items()}
+    elif scans:
+        i = scans[0]
+        ocr_by_page[i] = _ocr_page(rendered[i]["png"], rendered[i]["scale"], lang)
+
     pages_out, pages_store = [], []
     bid = 1
+    for pno, r in enumerate(rendered):
+        out_p, store_p, bid = _page_payload(r, bid, ocr_by_page.get(pno))
+        store_p["src"] = pno                   # which PDF page this came from
+        store_p["rot"] = rotations[pno]
+        out_p["index"] = pno
+        pages_store.append(store_p)
+        pages_out.append(out_p)
 
-    for pno in range(n_pages):
-        page = doc[pno]
-        rect = page.rect
-        scale = min(RENDER_SCALE, MAX_DIM / max(1.0, rect.width, rect.height))
-        scale = max(scale, 0.5)
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-        png = pix.tobytes("png")
+    STORE.put(sid, {"pdf": pdf_bytes, "pages": pages_store, "created": time.time(),
+                    "nextBid": bid, "lang": lang})
+    return {"session": sid, "ocrAvailable": HAS_OCR, "aiAvailable": ai_edit.available(),
+            "ocrLangs": OCR_LANGS, "lang": lang, "pages": pages_out}
 
-        tscale = THUMB_WIDTH / max(1.0, rect.width)
-        tpix = page.get_pixmap(matrix=fitz.Matrix(tscale, tscale), alpha=False, colorspace=fitz.csRGB)
-        thumb = tpix.tobytes("png")
 
-        # boxes → client (render px); meta → kept server-side (PDF points) for AI edits
-        boxes, meta = [], []
-        for run in extract_text_runs(page):
-            x0, y0, x1, y1 = run["rect"]
-            boxes.append({"id": bid, "x": x0 * scale, "y": y0 * scale,
-                          "w": (x1 - x0) * scale, "h": (y1 - y0) * scale,
-                          "text": run["text"], "kind": "text",
-                          "base": run["base"] * scale, "fontSize": run["fontSize"] * scale,
-                          "color": run["color"], "bold": run["bold"],
-                          "italic": run["italic"], "family": run["family"],
-                          "fontName": run["font"]})
-            meta.append({"id": bid, "rect": [x0, y0, x1, y1], "text": run["text"],
-                         "base": run["base"],
-                         "fontSize": run["fontSize"], "color": run["color"],
-                         "bold": run["bold"], "italic": run["italic"],
-                         "family": run["family"], "block": run["block"], "line": run["line"]})
+def _render_page(page) -> dict:
+    """Rasterize one page and pull its digital text layer off.
+
+    Everything here needs the PyMuPDF document, which is not thread-safe — so
+    this stays serial while the expensive OCR that follows does not.
+    """
+    rect = page.rect
+    scale = min(RENDER_SCALE, MAX_DIM / max(1.0, rect.width, rect.height))
+    scale = max(scale, 0.5)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
+    tscale = THUMB_WIDTH / max(1.0, rect.width)
+    tpix = page.get_pixmap(matrix=fitz.Matrix(tscale, tscale), alpha=False, colorspace=fitz.csRGB)
+    return {"png": pix.tobytes("png"), "thumb": tpix.tobytes("png"), "scale": scale,
+            "ptw": rect.width, "pth": rect.height, "pw": pix.width, "ph": pix.height,
+            "runs": extract_text_runs(page), "scanned": len(page.get_text("words")) == 0}
+
+
+def _page_payload(r: dict, bid: int, ocr=None):
+    """Turn a rendered page into ``(page_out, page_store, next_bid)`` — the
+    client payload (render pixels) and the server-side record (PDF points, used
+    by the AI endpoints and digitize).
+
+    ``ocr`` is a precomputed ``(boxes, meta)`` pair for a scanned page, so the
+    OCR can have run concurrently; ids are handed out here instead, keeping
+    them sequential in page order regardless.
+    """
+    scale = r["scale"]
+    boxes, meta = [], []
+    for run in r["runs"]:
+        x0, y0, x1, y1 = run["rect"]
+        boxes.append({"id": bid, "x": x0 * scale, "y": y0 * scale,
+                      "w": (x1 - x0) * scale, "h": (y1 - y0) * scale,
+                      "text": run["text"], "kind": "text",
+                      "base": run["base"] * scale, "fontSize": run["fontSize"] * scale,
+                      "color": run["color"], "bold": run["bold"],
+                      "italic": run["italic"], "family": run["family"],
+                      "fontName": run["font"]})
+        meta.append({"id": bid, "rect": [x0, y0, x1, y1], "text": run["text"],
+                     "base": run["base"],
+                     "fontSize": run["fontSize"], "color": run["color"],
+                     "bold": run["bold"], "italic": run["italic"],
+                     "family": run["family"], "block": run["block"], "line": run["line"]})
+        bid += 1
+
+    if ocr:
+        for box, mt in zip(*ocr):
+            box["id"] = mt["id"] = bid
+            boxes.append(box)
+            meta.append(mt)
             bid += 1
 
-        scanned = len(page.get_text("words")) == 0
-        if scanned and HAS_OCR:
-            bid = _ocr_page(png, scale, boxes, meta, bid)
+    store = {"png": r["png"], "thumb": r["thumb"], "scale": scale, "boxes": meta,
+             "ptw": r["ptw"], "pth": r["pth"], "scanned": r["scanned"]}
+    out = {"width": r["pw"], "height": r["ph"], "scanned": r["scanned"], "boxes": boxes}
+    return out, store, bid
 
-        pages_store.append({"png": png, "thumb": thumb, "scale": scale, "boxes": meta,
-                            "ptw": rect.width, "pth": rect.height, "scanned": scanned})
-        pages_out.append({"index": pno, "width": pix.width, "height": pix.height,
-                          "scanned": scanned, "boxes": boxes})
 
-    doc.close()
-    SESSIONS[sid] = {"pdf": pdf_bytes, "pages": pages_store, "created": time.time()}
-    cleanup_sessions()
-    return {"session": sid, "ocrAvailable": HAS_OCR, "aiAvailable": ai_edit.available(),
-            "pages": pages_out}
+def _analyze_page(page, bid: int, lang: str):
+    """Render and fully detect a single page — the /api/rotate path, where
+    there is nothing to run concurrently."""
+    r = _render_page(page)
+    ocr = _ocr_page(r["png"], r["scale"], lang) if r["scanned"] and HAS_OCR else None
+    return _page_payload(r, bid, ocr)
+
+
+# ── Page operations (rotate / reorder / delete) ──────────────────────────────
+@app.post("/api/rotate")
+async def rotate(session: str = Form(...), page: int = Form(...), deg: int = Form(90)):
+    """Rotate one page and RE-DETECT its text.
+
+    Rotating the client's canvases alone would leave every text box pointing at
+    the wrong pixels — worse, a sideways scan would keep its sideways boxes. So
+    the page is re-rendered from the stored PDF at its new rotation and run
+    through the same detection path as a fresh upload; the client reloads it.
+    """
+    sess = _get_session(session)
+    if not 0 <= page < len(sess["pages"]):
+        raise HTTPException(404, "No such page")
+    if deg % 90 != 0:
+        raise HTTPException(400, "Rotation must be a multiple of 90°.")
+    p = sess["pages"][page]
+    doc = fitz.open(stream=sess["pdf"], filetype="pdf")
+    try:
+        src = p.get("src", page)
+        if not 0 <= src < doc.page_count:
+            raise HTTPException(404, "Page is no longer in the document")
+        pg = doc[src]
+        rot = (p.get("rot", pg.rotation) + int(deg)) % 360
+        pg.set_rotation(rot)
+        bid = sess.get("nextBid", 1)
+        out_p, store_p, bid = _analyze_page(pg, bid, sess.get("lang", ""))
+    finally:
+        doc.close()
+    store_p["src"] = src
+    store_p["rot"] = rot
+    sess["pages"][page] = store_p
+    sess["nextBid"] = bid
+    STORE.save_page(session, page)             # only this page's pixels changed
+    out_p["index"] = page
+    out_p["rotation"] = rot
+    return {"page": out_p}
+
+
+@app.post("/api/pages")
+async def reorder_pages(session: str = Form(...), order: str = Form(...)):
+    """Reorder and/or drop pages. ``order`` is a JSON array of the CURRENT page
+    indices to keep, in their new order — omitting an index deletes that page.
+
+    The server has to follow along: digitize, AI edit and AI chat all read the
+    session's page list, and they would otherwise still see pages the user
+    deleted minutes ago.
+    """
+    sess = _get_session(session)
+    n = len(sess["pages"])
+    try:
+        idx = json.loads(order)
+    except ValueError:
+        raise HTTPException(400, "Malformed page order")
+    if (not isinstance(idx, list) or not idx
+            or not all(isinstance(i, int) and 0 <= i < n for i in idx)
+            or len(set(idx)) != len(idx)):
+        raise HTTPException(400, "Page order must be distinct indices of existing pages.")
+    sess["pages"] = [sess["pages"][i] for i in idx]
+    STORE.put(session, sess)
+    return {"pages": len(sess["pages"])}
 
 
 _ASCENDERS = set("bdfhklt!?$&@#%/\\()[]{}\"'`|0123456789")
@@ -328,14 +466,32 @@ def _calibrate_page_boxes(added, added_meta, scale):
         bx.pop("_stroke", None)
 
 
-def _ocr_page(png_bytes, scale, boxes, meta, bid):
+def _clean_lang(lang: str) -> str:
+    """Validate a requested OCR language against what Tesseract actually has.
+
+    Accepts Tesseract's multi-language form ("uzb+eng"): unknown codes are
+    dropped rather than rejected, because a missing pack must not turn a
+    perfectly analyzable upload into an error.
+    """
+    codes = [c for c in (lang or "").replace(" ", "").split("+") if c]
+    keep = [c for c in codes if c in OCR_LANGS] if OCR_LANGS else []
+    return "+".join(dict.fromkeys(keep)) or DEFAULT_OCR_LANG
+
+
+def _ocr_page(png_bytes, scale, lang: str = ""):
     """Detect ALL words via Tesseract on a cleaned-up image. Style is estimated:
     em size + baseline from the glyph box (see _ocr_metrics), color sampled from
-    the pixels. Coords map back to page px via the upscale factor."""
-    start = len(boxes)
+    the pixels. Coords map back to page px via the upscale factor.
+
+    Returns ``(boxes, meta)`` carrying placeholder ids — this runs in a worker
+    thread, so the caller numbers the runs afterwards to keep ids sequential in
+    page order. Touches nothing but its own arguments.
+    """
+    boxes, meta = [], []
     pil, up = scan.preprocess_for_ocr(png_bytes)
     cv_img = scan._to_cv(png_bytes)                    # color image for ink sampling
-    data = pytesseract.image_to_data(pil, config="--oem 3 --psm 3",
+    data = pytesseract.image_to_data(pil, lang=lang or DEFAULT_OCR_LANG,
+                                     config="--oem 3 --psm 3",
                                      output_type=pytesseract.Output.DICT)
     for i, word in enumerate(data["text"]):
         text = (word or "").strip()
@@ -350,13 +506,12 @@ def _ocr_page(png_bytes, scale, boxes, meta, bid):
         box, mt = _styled_word(cv_img, text,
                                data["left"][i] / up, data["top"][i] / up,
                                data["width"][i] / up, data["height"][i] / up,
-                               scale, bid,
+                               scale, 0,
                                block=int(data["block_num"][i]), line=int(data["line_num"][i]))
         boxes.append(box)
         meta.append(mt)
-        bid += 1
-    _calibrate_page_boxes(boxes[start:], meta[start:], scale)
-    return bid
+    _calibrate_page_boxes(boxes, meta, scale)
+    return boxes, meta
 
 
 # ── Page / thumbnail streaming ───────────────────────────────────────────────
@@ -486,7 +641,9 @@ async def ai_ocr(session: str = Form(...), page: int = Form(...)):
         raise HTTPException(503, str(e))
     except ai_edit.AiError as e:
         raise HTTPException(502, str(e))
-    return {"fixes": _apply_ocr_fixes(p, fixes)}
+    applied = _apply_ocr_fixes(p, fixes)
+    STORE.save_meta(session)               # corrected text must survive a restart
+    return {"fixes": applied}
 
 
 @app.post("/api/ai-fonts")
@@ -510,6 +667,29 @@ _PDF_FONTS = {  # (family, bold, italic) → PDF base-14 shortcut
     "serif": {(False, False): "tiro", (True, False): "tibo", (False, True): "tiit", (True, True): "tibi"},
     "mono": {(False, False): "cour", (True, False): "cobo", (False, True): "coit", (True, True): "cobi"},
 }
+
+
+def _unicode_font_file() -> Optional[str]:
+    """A TTF with Cyrillic / Latin-Extended coverage, for digitize.
+
+    The base-14 PDF fonts above are WinAnsi-encoded, so Cyrillic and the Uzbek
+    oʻ/gʻ characters come out blank or garbled. Any word with a non-ASCII
+    character is written with this font instead. Set UNICODE_FONT to override
+    the search; the Docker image installs DejaVu for the first path.
+    """
+    candidates = [os.environ.get("UNICODE_FONT", "").strip(),
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                  "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                  "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                  "/Library/Fonts/Arial Unicode.ttf",
+                  "C:/Windows/Fonts/arial.ttf"]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return None
+
+
+UNICODE_FONT = _unicode_font_file()
 
 
 @app.post("/api/digitize")
@@ -537,14 +717,29 @@ async def digitize(session: str = Form(...), useAi: str = Form("0")):
             background = scan.erase(p["png"], rects) if rects else p["png"]
             page = out.new_page(width=p["ptw"], height=p["pth"])
             page.insert_image(page.rect, stream=background)
+            has_uni = False                     # the Unicode face, embedded on demand
             for b in p["boxes"]:
                 x0, _, _, y1 = b["rect"]
-                fonts = _PDF_FONTS.get(b.get("family", "sans"), _PDF_FONTS["sans"])
-                fontname = fonts[(bool(b.get("bold")), bool(b.get("italic")))]
+                text = b["text"]
+                if text.isascii():
+                    fonts = _PDF_FONTS.get(b.get("family", "sans"), _PDF_FONTS["sans"])
+                    fontname = fonts[(bool(b.get("bold")), bool(b.get("italic")))]
+                    fontfile = None
+                elif UNICODE_FONT:
+                    # one embedded weight for every non-ASCII run: bold/italic are
+                    # lost, which beats the blank boxes base-14 would produce
+                    fontname, fontfile = "uni", (None if has_uni else UNICODE_FONT)
+                    has_uni = True
+                else:
+                    continue                    # no Unicode face → leave it as image
                 r, g, bl = _hex_to_rgb(b.get("color", "#000000"))
-                page.insert_text((x0, b.get("base", y1)), b["text"],
-                                 fontsize=b["fontSize"], fontname=fontname,
-                                 color=(r / 255, g / 255, bl / 255))
+                try:
+                    page.insert_text((x0, b.get("base", y1)), text,
+                                     fontsize=b["fontSize"], fontname=fontname,
+                                     fontfile=fontfile,
+                                     color=(r / 255, g / 255, bl / 255))
+                except Exception:
+                    pass                        # unmappable glyph — keep the raster
         data = out.tobytes(garbage=3, deflate=True)
     finally:
         out.close()
@@ -662,7 +857,7 @@ async def support(message: str = Form(...), session: str = Form(""),
 
     # attach the document the user is stuck on straight from its live session,
     # so they don't have to re-upload the file they already opened
-    sess = SESSIONS.get(session)
+    sess = STORE.get(session) if session else None
     if sess and not (tdir / "document.pdf").exists():
         try:
             (tdir / "session-document.pdf").write_bytes(sess["pdf"])
@@ -677,13 +872,36 @@ async def support(message: str = Form(...), session: str = Form(""),
     return {"ticket": ticket}
 
 
+@app.get("/api/langs")
+async def langs():
+    """OCR languages this server can use, so the UI can offer them at upload."""
+    return {"langs": OCR_LANGS, "default": _clean_lang("")}
+
+
 @app.get("/api/health")
 async def health():
     return JSONResponse({"ok": True, "ocr": HAS_OCR, "ai": ai_edit.available(),
-                         "sessions": len(SESSIONS)})
+                         "langs": OCR_LANGS, "sessions": len(STORE)})
 
 
 # ── Static frontend (mounted last so /api/* wins) ────────────────────────────
+class _HashedStatic(StaticFiles):
+    """Cache the build correctly.
+
+    Vite fingerprints every file under assets/ (index-<hash>.js), so those can
+    be cached forever — a new build is a new URL. index.html must NOT be: it is
+    the file that names the current bundle, and without an explicit no-cache the
+    browser's heuristic caching leaves users running the previous deploy until
+    they think to hard-refresh.
+    """
+
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = ("public, max-age=31536000, immutable"
+                                         if path.startswith("assets/") else "no-cache")
+        return resp
+
+
 _WEB_DIST = ROOT / "web" / "dist"
 if (_WEB_DIST / "index.html").exists():
-    app.mount("/", StaticFiles(directory=str(_WEB_DIST), html=True), name="static")
+    app.mount("/", _HashedStatic(directory=str(_WEB_DIST), html=True), name="static")

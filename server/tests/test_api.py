@@ -1,5 +1,6 @@
 """API tests — document upload/render pipeline and the abuse guards."""
 import io
+import time
 
 import app as appmod
 import fitz
@@ -403,6 +404,236 @@ def test_ai_chat_answers_with_mocked_model(monkeypatch):
     resp = client.post("/api/ai-chat", data={"session": sid, "question": "What fruit?"})
     assert resp.status_code == 200
     assert resp.json()["answer"] == "It mentions Apple."
+
+
+def test_langs_endpoint_lists_installed_packs():
+    r = client.get("/api/langs")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["langs"], list)
+    assert body["default"]                                  # always resolves to something
+    if appmod.HAS_OCR:
+        assert "eng" in body["langs"]
+
+
+def test_clean_lang_drops_unavailable_codes(monkeypatch):
+    """A missing language pack must degrade, never turn an upload into an error."""
+    monkeypatch.setattr(appmod, "OCR_LANGS", ["eng", "rus", "uzb"])
+    monkeypatch.setattr(appmod, "DEFAULT_OCR_LANG", "eng")
+    assert appmod._clean_lang("uzb+eng") == "uzb+eng"
+    assert appmod._clean_lang("uzb+klingon") == "uzb"       # unknown code dropped
+    assert appmod._clean_lang("klingon") == "eng"           # nothing left → default
+    assert appmod._clean_lang("") == "eng"
+    assert appmod._clean_lang("rus + rus") == "rus"         # spaces and dupes
+
+
+def test_analyze_passes_language_to_tesseract(monkeypatch):
+    """The chosen language must actually reach pytesseract, not just the response."""
+    seen = {}
+
+    def fake_ocr(png, scale, lang=""):
+        seen["lang"] = lang
+        return [], []
+
+    monkeypatch.setattr(appmod, "OCR_LANGS", ["eng", "uzb"])
+    monkeypatch.setattr(appmod, "HAS_OCR", True)
+    monkeypatch.setattr(appmod, "_ocr_page", fake_ocr)
+    r = client.post("/api/analyze",
+                    data={"lang": "uzb+eng"},
+                    files={"file": ("scan.png", _png(300, 200), "image/png")})
+    assert r.status_code == 200
+    assert seen["lang"] == "uzb+eng"
+    assert r.json()["lang"] == "uzb+eng"
+
+
+def test_concurrent_ocr_keeps_run_ids_sequential_by_page(monkeypatch):
+    """Pages are OCR'd in a thread pool, so ids are handed out afterwards —
+    they must still run in page order, because /api/ai-edit and the client's
+    box lookups both key off them."""
+    import threading
+    seen_threads = set()
+
+    def fake_ocr(png, scale, lang=""):
+        seen_threads.add(threading.get_ident())
+        time.sleep(0.02)                                    # let the pool overlap
+        box = {"id": 0, "x": 1.0, "y": 2.0, "w": 3.0, "h": 4.0, "text": "42",
+               "kind": "ocr", "base": 5.0, "fontSize": 6.0, "color": "#000000",
+               "bold": False, "italic": False, "family": "sans"}
+        mt = {"id": 0, "rect": [0, 0, 1, 1], "text": "42", "base": 1.0, "fontSize": 1.0,
+              "color": "#000000", "bold": False, "italic": False, "family": "sans",
+              "block": 0, "line": 0}
+        return [dict(box), dict(box)], [dict(mt), dict(mt)]
+
+    monkeypatch.setattr(appmod, "HAS_OCR", True)
+    monkeypatch.setattr(appmod, "_ocr_page", fake_ocr)
+    # image-only pages → every page takes the OCR path
+    doc = fitz.open()
+    for _ in range(4):
+        doc.new_page(width=200, height=150)
+    data = doc.tobytes()
+    doc.close()
+
+    r = client.post("/api/analyze", files={"file": ("scan.pdf", data, "application/pdf")})
+    assert r.status_code == 200
+    pages = r.json()["pages"]
+    assert len(pages) == 4
+    ids = [b["id"] for p in pages for b in p["boxes"]]
+    assert ids == list(range(1, len(ids) + 1)), f"ids not sequential in page order: {ids}"
+    assert len(seen_threads) > 1, "pages were not OCR'd concurrently"
+
+
+def test_digitize_keeps_non_ascii_text(monkeypatch):
+    """Cyrillic / Uzbek characters must survive digitize, not come out blank."""
+    if not appmod.UNICODE_FONT:
+        pytest.skip("no Unicode font installed on this machine")
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=300)
+    page.insert_text((50, 100), "Ҳисоб рақами", fontsize=18,
+                     fontfile=appmod.UNICODE_FONT, fontname="uni")
+    data = doc.tobytes()
+    doc.close()
+    r = client.post("/api/analyze", files={"file": ("t.pdf", data, "application/pdf")})
+    sid = r.json()["session"]
+    resp = client.post("/api/digitize", data={"session": sid, "useAi": "0"})
+    assert resp.status_code == 200
+    out = fitz.open(stream=resp.content, filetype="pdf")
+    text = out[0].get_text()
+    out.close()
+    assert "Ҳисоб" in text, f"digitize dropped the Cyrillic text: {text!r}"
+
+
+# ── page operations ──────────────────────────────────────────────────────────
+def _multipage_pdf(n=3):
+    doc = fitz.open()
+    for i in range(n):
+        doc.new_page(width=400, height=300).insert_text((60, 100), f"Page{i}", fontsize=20)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_rotate_swaps_dimensions_and_remaps_boxes():
+    """Rotation must re-detect: the boxes have to follow the pixels, otherwise
+    every word on the page becomes unclickable."""
+    r = client.post("/api/analyze",
+                    files={"file": ("t.pdf", _pdf_with_text("Apple"), "application/pdf")})
+    sid = r.json()["session"]
+    before = r.json()["pages"][0]
+    resp = client.post("/api/rotate", data={"session": sid, "page": "0", "deg": "90"})
+    assert resp.status_code == 200
+    after = resp.json()["page"]
+    assert after["rotation"] == 90
+    assert abs(after["width"] - before["height"]) <= 2      # portrait ↔ landscape
+    assert abs(after["height"] - before["width"]) <= 2
+    box = after["boxes"][0]
+    assert box["text"] == "Apple"
+    assert 0 <= box["x"] and box["x"] + box["w"] <= after["width"] + 1
+    assert 0 <= box["y"] and box["y"] + box["h"] <= after["height"] + 1
+    # rotation accumulates rather than resetting
+    assert client.post("/api/rotate", data={"session": sid, "page": "0", "deg": "90"}
+                       ).json()["page"]["rotation"] == 180
+
+
+def test_rotate_rejects_bad_input():
+    r = client.post("/api/analyze",
+                    files={"file": ("t.pdf", _pdf_with_text(), "application/pdf")})
+    sid = r.json()["session"]
+    assert client.post("/api/rotate", data={"session": sid, "page": "0", "deg": "45"}).status_code == 400
+    assert client.post("/api/rotate", data={"session": sid, "page": "7", "deg": "90"}).status_code == 404
+
+
+def test_pages_reorder_and_delete_follow_through_to_the_server():
+    """Deleting a page client-side isn't enough — digitize and the AI endpoints
+    read the server's page list."""
+    r = client.post("/api/analyze", files={"file": ("t.pdf", _multipage_pdf(3), "application/pdf")})
+    sid = r.json()["session"]
+    resp = client.post("/api/pages", data={"session": sid, "order": "[2, 0]"})
+    assert resp.status_code == 200 and resp.json()["pages"] == 2
+    # the digitized document now has exactly the kept pages, in the new order
+    out = fitz.open(stream=client.post("/api/digitize", data={"session": sid}).content,
+                    filetype="pdf")
+    assert out.page_count == 2
+    assert "Page2" in out[0].get_text() and "Page0" in out[1].get_text()
+    out.close()
+    assert client.get(f"/api/page/{sid}/2").status_code == 404      # really gone
+
+
+def test_pages_rejects_invalid_order():
+    r = client.post("/api/analyze", files={"file": ("t.pdf", _multipage_pdf(2), "application/pdf")})
+    sid = r.json()["session"]
+    for bad in ("[]", "[0, 0]", "[5]", "[-1]", "not-json", '["a"]'):
+        assert client.post("/api/pages", data={"session": sid, "order": bad}).status_code == 400
+    assert len(client.post("/api/digitize", data={"session": sid}).content) > 0   # untouched
+
+
+# ── session store ────────────────────────────────────────────────────────────
+def _store(tmp_path, **kw):
+    from store import SessionStore
+    return SessionStore(root=tmp_path / "sessions", ttl=kw.pop("ttl", 3600), **kw)
+
+
+def _session(n_pages=1):
+    return {"pdf": b"%PDF-fake", "created": time.time(),
+            "pages": [{"png": _png(20, 10), "thumb": _png(8, 4), "scale": 2.0,
+                       "ptw": 400.0, "pth": 300.0, "scanned": False,
+                       "boxes": [{"id": 1, "text": "Apple", "rect": [1, 2, 3, 4]}]}
+                      for _ in range(n_pages)]}
+
+
+def test_store_survives_a_restart(tmp_path):
+    """A fresh store over the same directory must find the earlier session —
+    this is the whole point: a redeploy shouldn't evict everyone's document."""
+    s1 = _store(tmp_path)
+    s1.put("abc123", _session(2))
+    s2 = _store(tmp_path)                                   # "restart"
+    got = s2.get("abc123")
+    assert got is not None
+    assert got["pdf"] == b"%PDF-fake"
+    assert len(got["pages"]) == 2
+    assert got["pages"][0]["boxes"][0]["text"] == "Apple"
+    assert got["pages"][1]["png"] == _png(20, 10)           # image bytes round-trip
+    assert got["pages"][0]["scale"] == 2.0
+
+
+def test_store_evicts_from_memory_but_keeps_disk(tmp_path):
+    s = _store(tmp_path, max_cached=2)
+    for i in range(4):
+        sess = _session()
+        sess["created"] = time.time() + i                   # deterministic ordering
+        s.put(f"sid{i}", sess)
+    assert len(s._mem) <= 2                                 # memory trimmed
+    assert s.get("sid0") is not None                        # …but still loadable
+    assert len(s) == 4
+
+
+def test_store_expires_sessions(tmp_path):
+    s = _store(tmp_path, ttl=0)
+    s.put("gone", _session())
+    s.cleanup()
+    assert s.get("gone") is None
+    assert len(s) == 0
+
+
+def test_store_save_meta_persists_text_edits(tmp_path):
+    """AI OCR fixes change box text with no pixel change — they must be saved."""
+    s1 = _store(tmp_path)
+    s1.put("sid", _session())
+    s1.get("sid")["pages"][0]["boxes"][0]["text"] = "CORRECTED"
+    s1.save_meta("sid")
+    assert _store(tmp_path).get("sid")["pages"][0]["boxes"][0]["text"] == "CORRECTED"
+
+
+def test_store_rejects_path_traversal(tmp_path):
+    s = _store(tmp_path)
+    for evil in ("../../etc", "a/b", "..", "a.b"):
+        assert s.get(evil) is None
+
+
+def test_store_memory_only_mode(tmp_path):
+    s = _store(tmp_path, persist=False)
+    s.put("sid", _session())
+    assert s.get("sid") is not None                         # served from memory
+    assert not (tmp_path / "sessions" / "sid").exists()      # nothing written
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -24,7 +24,7 @@ jobs:
         run: pytest -q
 
   web:
-    name: Web (lint + build)
+    name: Web (lint + test + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -40,5 +40,7 @@ jobs:
         run: npm ci
       - name: Lint (eslint)
         run: npm run lint
+      - name: Test (vitest)
+        run: npm test
       - name: Build
         run: npm run build

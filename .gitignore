@@ -12,3 +12,6 @@ __pycache__/
 
 # Support inbox (user problem reports)
 server/support/
+
+# Analyzed-document sessions (disk-backed store)
+server/sessions/

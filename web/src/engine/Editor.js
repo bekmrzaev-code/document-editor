@@ -52,6 +52,33 @@ const FAMILIES = {
   mono: "'Courier New', ui-monospace, monospace",
 };
 
+/* Every undo entry holds full ImageData before/after pairs of the patched
+   region, so an uncapped stack quietly grows into hundreds of megabytes over a
+   long session on a large page. */
+const MAX_HISTORY = 60;
+
+/* What the Numbers tool marks: any run carrying a digit. On invoices and bills
+   of lading that catches amounts, quantities, dates, invoice and container
+   numbers alike — the things people actually blank out — while leaving plain
+   words alone. */
+export const isNumericRun = (text) => /\d/.test(text || "");
+
+/* Tools whose clicks land on the text overlay rather than the bare canvas. */
+const CLICKS_WORDS = new Set(["edit", "numbers"]);
+
+/* Entries for the format bar's font menu, as [value, label] pairs.
+   The document's OWN font leads the list: a digital PDF run carries a real
+   name ("ABCDEF+Helvetica-Bold"), and with no entry for it the select sits
+   blank on the very font the text is actually set in. */
+export function fontOptions(ownFontName, aiFonts = []) {
+  const out = [];
+  if (ownFontName) out.push([`font:${ownFontName}`, ownFontName.split("+").pop()]);
+  out.push(["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]);
+  for (const f of aiFonts) if (f?.font) out.push([`font:${f.font}`, f.font]);
+  const seen = new Set();
+  return out.filter(([v]) => !seen.has(v) && seen.add(v));
+}
+
 /* Try the document's real font first (works when it's installed locally, e.g.
    Arial/Calibri/Times), falling back to the family's web-safe stack. PDF font
    names carry subset prefixes ("ABCDEF+Arial-Bold") and style suffixes that
@@ -76,11 +103,27 @@ export default class Editor {
     this.aiAvailable = false;
     this.aiProposals = [];
     this.aiEditLoading = false;
+    this.sessionExpired = false;   // server lost the session → edits can't be patched
+    this.ocrLangs = [];
+    this.lang = localStorage.getItem("docedit.lang") || "eng";
+    this.aiMessages = [];          // [{ role: "you" | "ai", text, error? }]
+    this.aiLoading = false;
+    this.ocrFixLoading = false;
+    this.fonts = [];               // AI-identified page fonts
+    this.fontsLoading = false;
+    this.digitizing = false;
+    this.findQuery = "";
+    this.findOpts = { matchCase: false, whole: false };
+    this.matches = [];
+    // null per field = "keep whatever was detected"; anything set wins
+    this.style = { size: null, color: null, bold: null, italic: null, family: null, fontName: null };
+    this.exportSel = null;         // null = every page; else a Set of page indices
     this.pages = [];
     this.current = -1;
     this.zoom = 1;
-    this.tool = "edit";            // "edit" (click words) | "erase" | "copy"
+    this.tool = "edit";            // "edit" (click words) | "erase" | "copy" | "text"
     this._paste = null;            // { page, clip, w, h, x, y, el } while placing a copy
+    this._insert = null;           // { page, x, y, size, el } while typing new text
     this._space = false;           // space held → pan
     this.showOverlays = true;
     this._edit = null;             // { page, box, el } while an inline editor is open
@@ -101,13 +144,17 @@ export default class Editor {
     this.thumbsEl = thumbsEl;
     this._onResize = () => { clearTimeout(this._rt); this._rt = setTimeout(() => { if (this.current >= 0) this.layoutCanvas(this.pages[this.current]); }, 120); };
     window.addEventListener("resize", this._onResize);
+    // window resize alone misses the cases that matter most: the stage getting
+    // its first real size, and the panels changing width around it
+    this._ro = new ResizeObserver(() => { if (this.current >= 0) this.layoutCanvas(this.pages[this.current]); });
+    this._ro.observe(stageEl);
     this._onSpaceDown = (e) => { if (e.code === "Space" && e.target.tagName !== "INPUT" && e.target.tagName !== "TEXTAREA") { this._space = true; e.preventDefault(); } };
     this._onSpaceUp = (e) => { if (e.code === "Space") this._space = false; };
     window.addEventListener("keydown", this._onSpaceDown);
     window.addEventListener("keyup", this._onSpaceUp);
     this.emit();
   }
-  destroy() { window.removeEventListener("resize", this._onResize); window.removeEventListener("keydown", this._onSpaceDown); window.removeEventListener("keyup", this._onSpaceUp); }
+  destroy() { window.removeEventListener("resize", this._onResize); window.removeEventListener("keydown", this._onSpaceDown); window.removeEventListener("keyup", this._onSpaceUp); this._ro?.disconnect(); }
 
   /* ── state snapshot for React ───────────────────────────────────────── */
   snapshot() {
@@ -117,9 +164,17 @@ export default class Editor {
       loading: this.loading, loadingText: this.loadingText, progress: this.progress,
       current: this.current, pageCount: this.pages.length, zoom: this.zoom,
       scanned: p ? p.scanned : false, ocrAvailable: this.ocrAvailable,
-      aiAvailable: this.aiAvailable,
+      aiAvailable: this.aiAvailable, sessionExpired: this.sessionExpired,
+      ocrLangs: this.ocrLangs, lang: this.lang,
       aiProposals: this.aiProposals, aiEditLoading: this.aiEditLoading,
+      aiMessages: this.aiMessages, aiLoading: this.aiLoading,
+      ocrFixLoading: this.ocrFixLoading, digitizing: this.digitizing,
+      fonts: this.fonts, fontsLoading: this.fontsLoading,
+      findQuery: this.findQuery, findOpts: this.findOpts, matches: this.matches,
+      style: this.style,
+      exportPages: this.exportSel ? [...this.exportSel] : null,
       count: p ? p.boxes.filter((b) => !b.erased).length : 0,
+      numCount: p ? p.boxes.filter((b) => !b.erased && isNumericRun(b.text)).length : 0,
       showOverlays: this.showOverlays, tool: this.tool, pasteActive: !!this._paste,
       canUndo: this.undoStack.length > 0, canRedo: this.redoStack.length > 0,
       status: this.status,
@@ -161,12 +216,66 @@ export default class Editor {
 
   async _readJson(blob) { try { return JSON.parse(await blob.text()); } catch { return {}; } }
 
+  /* Every server call goes through here so a dead session surfaces in the UI
+     once, instead of only in the console — the symptom used to be erasing that
+     silently stopped healing while the app still looked fine. */
+  async _post(path, formData, { raw = false } = {}) {
+    let res;
+    try { res = await fetch(this.api + path, { method: "POST", body: formData }); }
+    catch { throw new Error("Network error — check your connection."); }
+    if (!res.ok) {
+      const body = await res.clone().json().catch(() => ({}));
+      const detail = body.detail || `Server error ${res.status}`;
+      if (res.status === 404 && /session/i.test(detail)) this.markSessionExpired();
+      throw new Error(detail);
+    }
+    return raw ? res : res.json();
+  }
+
+  markSessionExpired() {
+    if (this.sessionExpired) return;                 // announce it once, not per edit
+    this.sessionExpired = true;
+    this.toast("The server lost this session — re-open the file to keep editing.", "error");
+    this.setStatus("Session expired — re-open the document to keep editing.");
+    this.emit();
+  }
+
+  _pushHistory(entry) {
+    this.undoStack.push(entry);
+    if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
+    this.redoStack = [];
+  }
+
+  _dropHistory(pred) {
+    this.undoStack = this.undoStack.filter((e) => !pred(e));
+    this.redoStack = this.redoStack.filter((e) => !pred(e));
+  }
+
+  setLang(lang) {
+    this.lang = lang;
+    try { localStorage.setItem("docedit.lang", lang); } catch { /* private mode */ }
+    this.emit();
+  }
+
+  /* Which OCR languages the server has installed — asked once, before any
+     upload, so the picker can be shown on the empty dropzone. */
+  async loadLangs() {
+    try {
+      const r = await fetch(this.api + "/api/langs");
+      if (!r.ok) return;
+      const { langs, default: dflt } = await r.json();
+      this.ocrLangs = langs || [];
+      if (this.ocrLangs.length && !this.ocrLangs.includes(this.lang)) this.lang = dflt || this.ocrLangs[0];
+      this.emit();
+    } catch { /* offline — analyze falls back to the server default */ }
+  }
+
   /* ── load + analyze ─────────────────────────────────────────────────── */
   async open(file) {
     let ticker = null;
     try {
       this.setLoading("Uploading… 0%", 300000);
-      const fd = new FormData(); fd.append("file", file);
+      const fd = new FormData(); fd.append("file", file); fd.append("lang", this.lang);
       const res = await this._upload(this.api + "/api/analyze", fd, (f) => {
         this.progress = f * 0.6;                      // upload = first 60% of the bar
         this.loadingText = `Uploading… ${Math.round(f * 100)}%`;
@@ -179,7 +288,11 @@ export default class Editor {
 
       this.session = json.session; this.ocrAvailable = !!json.ocrAvailable;
       this.aiAvailable = !!json.aiAvailable;
+      this.ocrLangs = json.ocrLangs || this.ocrLangs;
+      if (json.lang) this.lang = json.lang;              // server may have dropped a missing pack
       this.aiProposals = []; this.aiEditLoading = false;
+      this.aiMessages = []; this.fonts = []; this.matches = []; this.findQuery = "";
+      this.exportSel = null; this.sessionExpired = false;
       this.current = -1; this.undoStack = []; this.redoStack = []; this._edit = null;
       this.pages = json.pages.map((p) => ({
         w: p.width, h: p.height, scanned: p.scanned, index: p.index,
@@ -219,6 +332,7 @@ export default class Editor {
   async showPage(index) {
     if (index < 0 || index >= this.pages.length) return;
     this.commitReplace();                            // bake any open editor before leaving
+    this.commitInsert();
     const myNav = ++this.navSeq;
     const page = this.pages[index];
     if (!page.loaded) {
@@ -246,9 +360,11 @@ export default class Editor {
     overlay.className = "overlay-layer" + (this.showOverlays ? "" : " hidden");
     wrap.appendChild(overlay);
     page._overlay = overlay; page._wrap = wrap;
-    const marqueeTool = this.tool === "erase" || this.tool === "copy";
-    overlay.classList.toggle("no-hit", marqueeTool);
-    wrap.classList.toggle("erase-tool", marqueeTool);
+    // edit and numbers click words; the marquee/text tools need the bare canvas
+    const bareCanvas = !CLICKS_WORDS.has(this.tool);
+    overlay.classList.toggle("no-hit", bareCanvas);
+    wrap.classList.toggle("erase-tool", bareCanvas);
+    wrap.classList.toggle("numbers-tool", this.tool === "numbers");
     this.hostEl.appendChild(wrap);
     this.layoutCanvas(page);
     // re-measure on the next frame: React may still be swapping the dropzone
@@ -261,10 +377,21 @@ export default class Editor {
 
   layoutCanvas(page) {
     if (!page || !page.canvas) return;
-    const fit = Math.min((this.stageEl.clientWidth - 64) / page.w, (this.stageEl.clientHeight - 64) / page.h, 1);
+    const sw = this.stageEl.clientWidth, sh = this.stageEl.clientHeight;
+    // The stage measures 0×0 at mount (React is still swapping the dropzone for
+    // the canvas host) and whenever the tab is in the background. Carrying on
+    // would make `fit` negative, the CSS width invalid, and the canvas fall
+    // back to its full intrinsic size — which then throws off every screen-px
+    // measurement, the inline editor included. The ResizeObserver in mount()
+    // calls back the moment the stage really has a size.
+    if (sw <= 0 || sh <= 0) return;
+    const fit = Math.max(0.02, Math.min((sw - 64) / page.w, (sh - 64) / page.h, 1));
     const dispW = page.w * fit * this.zoom;
     page.canvas.style.width = dispW + "px";
     page.canvas.style.height = dispW * (page.h / page.w) + "px";
+    // an open editor is sized in screen px — it has to follow the new scale
+    if (this._edit?.page === page) this._layoutEditor(this._edit);
+    if (this._insert?.page === page) this._layoutEditor(this._insert);
   }
 
   /* ── text overlays ──────────────────────────────────────────────────── */
@@ -274,13 +401,21 @@ export default class Editor {
     for (const box of page.boxes) {
       if (box.erased) continue;
       const d = document.createElement("div");
-      d.className = "text-box" + (box.kind === "ocr" ? " ocr" : "");
+      // `num` is tagged on every render; only the Numbers tool styles it, so
+      // switching tools costs a class toggle on the wrapper, not a re-render
+      d.className = "text-box" + (box.kind === "ocr" ? " ocr" : "")
+        + (isNumericRun(box.text) ? " num" : "");
       d.dataset.id = box.id;
       d.style.left = (box.x / page.w) * 100 + "%"; d.style.top = (box.y / page.h) * 100 + "%";
       d.style.width = (box.w / page.w) * 100 + "%"; d.style.height = (box.h / page.h) * 100 + "%";
       d.title = box.text;
       d.addEventListener("pointerdown", (e) => e.stopPropagation());   // don't start a pan
-      d.addEventListener("click", (e) => { e.stopPropagation(); this.openReplaceEditor(page, box); });
+      d.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // in Numbers mode a plain click wipes the value — no editor in between
+        if (this.tool === "numbers") { this.commitReplace(); this.applyReplace(page, box, ""); return; }
+        this.openReplaceEditor(page, box);
+      });
       // right-click = instant erase, no editor round trip
       d.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); this.commitReplace(); this.applyReplace(page, box, ""); });
       overlay.appendChild(d);
@@ -291,61 +426,423 @@ export default class Editor {
 
   setTool(tool) {
     if (tool !== "copy") this.cancelPaste();
+    if (tool !== "text") this.commitInsert();
     this.tool = tool;
-    const marqueeTool = tool === "erase" || tool === "copy";
+    const bareCanvas = !CLICKS_WORDS.has(tool);
     const page = this.pages[this.current];
     if (page) {
-      page._overlay?.classList.toggle("no-hit", marqueeTool);        // marquee starts anywhere
-      page._wrap?.classList.toggle("erase-tool", marqueeTool);       // crosshair cursor
+      page._overlay?.classList.toggle("no-hit", bareCanvas);         // marquee starts anywhere
+      page._wrap?.classList.toggle("erase-tool", bareCanvas);        // crosshair cursor
+      page._wrap?.classList.toggle("numbers-tool", tool === "numbers");
     }
     this.setStatus(
       tool === "erase" ? "Drag over anything — a stamp, mark or leftover text — to remove it seamlessly."
       : tool === "copy" ? "Drag a box around anything to copy it, then drag the copy where you want it and Place."
+      : tool === "text" ? "Click anywhere to add new text — Enter saves, Esc cancels."
+      : tool === "numbers" ? "Every number is marked — click one to wipe it. ⌘Z undoes."
       : "Click any text to edit it — Enter saves, Esc cancels.");
+    this.emit();
+  }
+
+  /* The detected style is only a guess (especially on scans, where size and
+     weight are estimated from pixels). Anything pinned in the Style panel wins;
+     a null field keeps whatever was detected for that word. */
+  _styled(box) {
+    const s = this.style;
+    return {
+      size: s.size ?? box.fontSize,
+      color: s.color ?? box.color,
+      bold: s.bold ?? box.bold,
+      italic: s.italic ?? box.italic,
+      family: s.family ?? box.family,
+      // an explicitly picked family must not be overruled by the PDF's own font name
+      fontName: s.fontName ?? (s.family ? null : box.fontName),
+    };
+  }
+
+  /* ── floating format bar ────────────────────────────────────────────────
+     Pinned just above whatever text is being edited, the way Sejda does it:
+     the controls that decide how the replacement looks belong next to the
+     caret, not across the window in the inspector.
+
+     It lives inside the page wrapper, so it scrolls and zooms with the
+     document for free. `ctx` is the live edit record — mutating ctx.style
+     updates both the textarea preview and what finally gets drawn. */
+  _formatBar(page, ta, ctx) {
+    const bar = document.createElement("div");
+    bar.className = "fmt-bar";
+    // never let the bar start a pan, and keep clicks on plain buttons from
+    // blurring the textarea — blur commits the edit
+    bar.addEventListener("pointerdown", (e) => e.stopPropagation());
+    bar.addEventListener("mousedown", (e) => {
+      if (!/^(INPUT|SELECT)$/.test(e.target.tagName)) e.preventDefault();
+    });
+
+    const preview = () => {
+      const st = ctx.style;
+      ta.style.color = st.color || "#111";
+      ta.style.fontWeight = st.bold ? "700" : "400";
+      ta.style.fontStyle = st.italic ? "italic" : "normal";
+      ta.style.fontFamily = fontStack({ fontName: st.fontName, family: st.family });
+      this._layoutEditor(ctx);                       // size and position follow the zoom
+    };
+    const set = (patch) => { Object.assign(ctx.style, patch); preview(); sync(); };
+
+    const mk = (tag, cls, txt) => {
+      const el = document.createElement(tag);
+      if (cls) el.className = cls;
+      if (txt != null) el.textContent = txt;
+      bar.appendChild(el);
+      return el;
+    };
+
+    // drag grip — moves the text being edited
+    const grip = mk("button", "fmt-btn fmt-grip", "⠿");
+    grip.title = "Drag to move this text";
+    this._attachEditDrag(page, grip, ctx, ta);
+
+    const fam = mk("select", "fmt-select");
+    for (const [value, label] of fontOptions(ctx.style.fontName, this.fonts)) {
+      const o = document.createElement("option");
+      o.value = value; o.textContent = label;
+      fam.appendChild(o);
+    }
+    fam.addEventListener("change", () => {
+      const v = fam.value;
+      if (v.startsWith("font:")) {
+        const name = v.slice(5);
+        ensureWebFont(name, { bold: ctx.style.bold, italic: ctx.style.italic });
+        set({ fontName: name });
+      } else {
+        set({ family: v, fontName: null });
+      }
+    });
+
+    // size, with steppers
+    mk("span", "fmt-sep");
+    const minus = mk("button", "fmt-btn", "−");
+    minus.title = "Smaller";
+    const size = mk("input", "fmt-num");
+    size.type = "number"; size.min = "4"; size.max = "300"; size.step = "0.5";
+    const plus = mk("button", "fmt-btn", "+");
+    plus.title = "Bigger";
+    const bump = (d) => set({ size: clamp(Math.round((ctx.style.size + d) * 2) / 2, 4, 300) });
+    minus.addEventListener("click", () => bump(-1));
+    plus.addEventListener("click", () => bump(1));
+    size.addEventListener("input", () => {
+      const v = parseFloat(size.value);
+      if (!Number.isNaN(v)) set({ size: clamp(v, 4, 300) });
+    });
+
+    // weight / slant
+    mk("span", "fmt-sep");
+    const bold = mk("button", "fmt-btn fmt-b", "B");
+    bold.title = "Bold";
+    const ital = mk("button", "fmt-btn fmt-i", "I");
+    ital.title = "Italic";
+    bold.addEventListener("click", () => set({ bold: !ctx.style.bold }));
+    ital.addEventListener("click", () => set({ italic: !ctx.style.italic }));
+
+    // colour: swatch, hex, and an eyedropper that samples the page itself —
+    // matching an existing ink colour by eye is hopeless on a scan
+    mk("span", "fmt-sep");
+    const swatch = mk("input", "fmt-color");
+    swatch.type = "color";
+    const hex = mk("input", "fmt-hex");
+    hex.type = "text"; hex.spellcheck = false; hex.maxLength = 7;
+    const drop = mk("button", "fmt-btn", "⌖");
+    drop.title = "Pick a colour from the page";
+    swatch.addEventListener("input", () => set({ color: swatch.value }));
+    hex.addEventListener("input", () => {
+      if (/^#[0-9a-f]{6}$/i.test(hex.value)) set({ color: hex.value.toLowerCase() });
+    });
+    drop.addEventListener("click", () => this._pickColour(page, (c) => set({ color: c })));
+
+    const sync = () => {
+      const st = ctx.style;
+      fam.value = st.fontName ? "font:" + st.fontName : (st.family || "sans");
+      if (document.activeElement !== size) size.value = String(Math.round(st.size * 10) / 10);
+      bold.classList.toggle("on", !!st.bold);
+      ital.classList.toggle("on", !!st.italic);
+      const c = /^#[0-9a-f]{6}$/i.test(st.color || "") ? st.color : "#111111";
+      swatch.value = c;
+      if (document.activeElement !== hex) hex.value = c;
+    };
+
+    page._wrap.appendChild(bar);
+    ctx.bar = bar;
+    ctx.layoutBar = () => this._layoutBar(page, bar, ctx);
+    sync(); preview();
+    return bar;
+  }
+
+  /* display px per canvas px — the editor and its bar are chrome, so they are
+     sized in screen pixels while the page zooms underneath */
+  _displayScale(page) {
+    return (page.canvas.clientWidth || page.canvas.width) / page.canvas.width;
+  }
+
+  /* Re-apply an open editor's geometry at the CURRENT zoom.
+
+     The editor and its bar are chrome measured in screen pixels while the page
+     scales underneath, so their sizes have to be derived from the live display
+     scale every time — caching it at open time left the editor three times too
+     large whenever the stage hadn't finished laying out, and broke it outright
+     on zoom. */
+  _layoutEditor(ctx) {
+    if (!ctx || !ctx.el || !ctx.page.canvas) return;
+    const { page, el, style } = ctx;
+    const sc = this._displayScale(page);
+    el.style.left = ((ctx.x + (ctx.dx || 0)) / page.w) * 100 + "%";
+    el.style.top = ((ctx.y + (ctx.dy || 0)) / page.h) * 100 + "%";
+    el.style.fontSize = style.size * sc + "px";
+    el.style.height = ctx.h * sc + 8 + "px";
+    el.style.minWidth = Math.max((ctx.w || 0) * sc + 24, 80) + "px";
+    el.style.width = "auto";
+    el.style.width = Math.min(el.scrollWidth + 12, page.canvas.clientWidth || 9999) + "px";
+    if (ctx.bar) this._layoutBar(page, ctx.bar, ctx);
+  }
+
+  _layoutBar(page, bar, ctx) {
+    const sc = this._displayScale(page);
+    const cw = page.canvas.clientWidth || page.canvas.width;
+    const left = (ctx.x + (ctx.dx || 0)) * sc;
+    const top = (ctx.y + (ctx.dy || 0)) * sc;
+    const bw = bar.offsetWidth, bh = bar.offsetHeight;
+    // a bar wider than the zoomed-out page centres instead of being crushed
+    bar.style.left = (bw >= cw ? (cw - bw) / 2 : clamp(left, 0, cw - bw)) + "px";
+    // flip below the text when there is no room above it
+    const above = top - bh - 8;
+    bar.style.top = (above >= 0 ? above : top + ctx.h * sc + 8) + "px";
+  }
+
+  /* Drag the text being edited to a new spot (Sejda moves the whole text box).
+     Only the offset is tracked; the draw happens on commit, through the same
+     erase+draw path, so undo behaves exactly as it does for a plain edit. */
+  _attachEditDrag(page, handle, ctx, ta) {
+    let from = null;
+    const toCanvas = (e) => {
+      const r = page.canvas.getBoundingClientRect();
+      return { x: (e.clientX - r.left) * (page.w / r.width), y: (e.clientY - r.top) * (page.h / r.height) };
+    };
+    handle.addEventListener("pointerdown", (e) => {
+      handle.setPointerCapture(e.pointerId);
+      const p = toCanvas(e);
+      from = { x: p.x - (ctx.dx || 0), y: p.y - (ctx.dy || 0) };
+      e.preventDefault(); e.stopPropagation();
+    });
+    handle.addEventListener("pointermove", (e) => {
+      if (!from) return;
+      const p = toCanvas(e);
+      ctx.dx = clamp(p.x - from.x, -ctx.x, page.w - ctx.x - 4);
+      ctx.dy = clamp(p.y - from.y, -ctx.y, page.h - ctx.y - 4);
+      const sc = this._displayScale(page);
+      ta.style.left = ((ctx.x + ctx.dx) / page.w) * 100 + "%";
+      ta.style.top = ((ctx.y + ctx.dy) / page.h) * 100 + "%";
+      ctx.layoutBar();
+      void sc;
+    });
+    handle.addEventListener("pointerup", () => { from = null; });
+  }
+
+  /* One-shot colour picker: a transparent sheet over the page swallows the next
+     click and reads that pixel off the composite. */
+  _pickColour(page, done) {
+    const sheet = document.createElement("div");
+    sheet.className = "pick-sheet";
+    const finish = (e) => {
+      const r = page.canvas.getBoundingClientRect();
+      const x = clamp(Math.round((e.clientX - r.left) * (page.w / r.width)), 0, page.w - 1);
+      const y = clamp(Math.round((e.clientY - r.top) * (page.h / r.height)), 0, page.h - 1);
+      const [rr, gg, bb] = page.ctx.getImageData(x, y, 1, 1).data;
+      sheet.remove();
+      done("#" + [rr, gg, bb].map((v) => v.toString(16).padStart(2, "0")).join(""));
+    };
+    sheet.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); finish(e); });
+    page._wrap.appendChild(sheet);
+    this.setStatus("Click anywhere on the page to pick that colour.");
+  }
+
+  setStyle(patch) { this.style = { ...this.style, ...patch }; this.emit(); }
+  resetStyle() {
+    this.style = { size: null, color: null, bold: null, italic: null, family: null, fontName: null };
     this.emit();
   }
 
   /* ── inline replace editor ──────────────────────────────────────────── */
   openReplaceEditor(page, box) {
     this.commitReplace();                            // bake any editor already open
-    const sc = (page.canvas.clientWidth || page.canvas.width) / page.canvas.width;   // display px per canvas px
     const ta = document.createElement("textarea");
     ta.className = "replace-edit"; ta.rows = 1; ta.spellcheck = false;
     ta.value = box.text;
-    ta.style.left = (box.x / page.w) * 100 + "%";
-    ta.style.top = (box.y / page.h) * 100 + "%";
-    ta.style.minWidth = Math.max(box.w * sc + 24, 80) + "px";
-    ta.style.height = box.h * sc + 8 + "px";
-    ta.style.fontSize = box.fontSize * sc + "px";
-    ta.style.color = box.color;
-    ta.style.fontWeight = box.bold ? "700" : "400";
-    ta.style.fontStyle = box.italic ? "italic" : "normal";
-    ta.style.fontFamily = fontStack(box);
     page._wrap.appendChild(ta);
-    this._edit = { page, box, el: ta };
-    const autosize = () => { ta.style.width = "auto"; ta.style.width = Math.min(ta.scrollWidth + 12, page.canvas.clientWidth) + "px"; };
+    this._edit = { page, box, el: ta, style: this._styled(box),
+                   x: box.x, y: box.y, w: box.w, h: box.h, dx: 0, dy: 0 };
+    this._formatBar(page, ta, this._edit);           // also lays the editor out
+    const autosize = () => this._layoutEditor(this._edit);
     ta.addEventListener("input", autosize);
     ta.addEventListener("keydown", (ev) => {
       ev.stopPropagation();                          // don't fire global shortcuts while typing
       if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); this.commitReplace(); }
       else if (ev.key === "Escape") { ev.preventDefault(); this.cancelReplace(); }
     });
-    ta.addEventListener("blur", () => this.commitReplace());
+    // focus moving INTO the format bar must not end the edit
+    ta.addEventListener("blur", (ev) => {
+      if (this._edit?.bar?.contains(ev.relatedTarget)) return;
+      this.commitReplace();
+    });
     setTimeout(() => { ta.focus({ preventScroll: true }); ta.select(); autosize(); }, 0);
     this.emit();
   }
 
+  _closeEditor(ed) { ed.el.remove(); ed.bar?.remove(); ed.page._wrap?.querySelector(".pick-sheet")?.remove(); }
+
   commitReplace() {
     const ed = this._edit; if (!ed) return;
     this._edit = null;
-    const { page, box, el } = ed;
+    const { page, box, el, style, dx, dy } = ed;
     const newText = el.value.replace(/\s+$/, "");
-    el.remove();
-    if (newText === box.text) { this.emit(); return; }          // unchanged → no-op
-    this.applyReplace(page, box, newText);
+    this._closeEditor(ed);
+    // the format bar and the drag grip can change an edit without touching a
+    // single character, so "unchanged" has to mean text AND style AND position
+    const restyled = JSON.stringify(style) !== JSON.stringify(this._styled(box));
+    if (newText === box.text && !dx && !dy && !restyled) { this.emit(); return; }
+    this.applyReplace(page, box, newText, { style, dx, dy });
   }
 
-  cancelReplace() { const ed = this._edit; if (!ed) return; this._edit = null; ed.el.remove(); this.emit(); }
+  cancelReplace() { const ed = this._edit; if (!ed) return; this._edit = null; this._closeEditor(ed); this.emit(); }
+
+  /* ── insert brand-new text (text tool) ──────────────────────────────────── */
+  /* A label typed onto a page should match the document's body text, not some
+     fixed pixel size — so default to the page's own median run size. */
+  medianSize(page) {
+    if (page._medSize == null) {
+      const sizes = page.boxes.filter((b) => (b.text || "").length >= 3)
+        .map((b) => b.fontSize).sort((a, b) => a - b);
+      page._medSize = sizes.length ? sizes[sizes.length >> 1] : Math.max(12, page.h / 60);
+    }
+    return page._medSize;
+  }
+
+  openInsertEditor(page, pt) {
+    this.commitReplace();
+    this.commitInsert();                             // bake a previous insert first
+    const size = this.style.size ?? this.medianSize(page);
+    const ta = document.createElement("textarea");
+    ta.className = "replace-edit"; ta.rows = 1; ta.spellcheck = false;
+    ta.placeholder = "Type…";
+    page._wrap.appendChild(ta);
+    this._insert = {
+      page, x: pt.x, y: pt.y, w: 0, h: size * 1.2, dx: 0, dy: 0, el: ta,
+      style: { size, color: this.style.color || "#111", bold: !!this.style.bold,
+               italic: !!this.style.italic, family: this.style.family || "sans",
+               fontName: this.style.fontName },
+    };
+    this._formatBar(page, ta, this._insert);         // also lays the editor out
+    const autosize = () => this._layoutEditor(this._insert);
+    ta.addEventListener("input", autosize);
+    ta.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); this.commitInsert(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); this.cancelInsert(); }
+    });
+    ta.addEventListener("blur", (ev) => {
+      if (this._insert?.bar?.contains(ev.relatedTarget)) return;
+      this.commitInsert();
+    });
+    setTimeout(() => { ta.focus({ preventScroll: true }); autosize(); }, 0);
+    this.emit();
+  }
+
+  commitInsert() {
+    const ins = this._insert; if (!ins) return;
+    this._insert = null;
+    const { page, el, style } = ins;
+    const x = ins.x + (ins.dx || 0), y = ins.y + (ins.dy || 0);
+    const text = el.value.replace(/\s+$/, "");
+    this._closeEditor(ins);
+    if (!text.trim()) { this.emit(); return; }
+    // the click marks the text's top-left, so the baseline sits one em below
+    const anno = this.drawTextRun(page, {
+      text, x, y, w: 0, h: style.size * 1.2, base: y + style.size,
+      ...style,
+      origLen: 0, kind: "text", maxW: page.w - x - 6, stretch: false,
+    });
+    const idx = this.pages.indexOf(page);
+    this._pushHistory({ type: "replace", page: idx, boxId: null, base: null, anno, hiddenBoxes: [] });
+    this.composite(page);
+    this.updateThumb(idx);
+    this.setStatus(`Inserted "${text}"`);
+    this.emit();
+  }
+
+  cancelInsert() { const i = this._insert; if (!i) return; this._insert = null; this._closeEditor(i); this.emit(); }
+
+  /* ── find & replace (no AI, no round trip) ──────────────────────────────── */
+  /* Word runs already carry their text, so a plain search is instant and free —
+     the AI path costs a Gemini call for what is often a literal substitution. */
+  _findRegex(query, { matchCase, whole } = {}) {
+    const esc = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const body = whole ? `(?<![\\p{L}\\p{N}])${esc}(?![\\p{L}\\p{N}])` : esc;
+    return new RegExp(body, matchCase ? "gu" : "gui");
+  }
+
+  search(query, opts = this.findOpts) {
+    this.findQuery = query;
+    this.findOpts = { matchCase: !!opts.matchCase, whole: !!opts.whole };
+    this.matches = [];
+    const q = (query || "").trim();
+    if (q) {
+      const re = this._findRegex(q, this.findOpts);
+      this.pages.forEach((page, pi) => {
+        for (const b of page.boxes) {
+          re.lastIndex = 0;
+          if (!b.erased && re.test(b.text)) this.matches.push({ id: b.id, page: pi, text: b.text });
+        }
+      });
+    }
+    this.emit();
+    return this.matches;
+  }
+
+  _replaced(text, replacement) {
+    const q = (this.findQuery || "").trim();
+    if (!q) return text;
+    return text.replace(this._findRegex(q, this.findOpts), replacement);
+  }
+
+  async replaceMatch(id, replacement) {
+    const f = this._findBox(id);
+    if (!f || f.box.erased) return;
+    const idx = this.pages.indexOf(f.page);
+    if (idx !== this.current) await this.showPage(idx);
+    await this.ensurePageLoaded(f.page);
+    const next = this._replaced(f.box.text, replacement);
+    if (next !== f.box.text) this.applyReplace(f.page, f.box, next);
+    this.search(this.findQuery);
+  }
+
+  async replaceAll(replacement) {
+    const targets = [...this.matches];
+    if (!targets.length) return 0;
+    this.setLoading("Replacing…", Math.max(60000, targets.length * 2000));
+    let n = 0;
+    try {
+      for (const m of targets) {
+        const f = this._findBox(m.id);
+        if (!f || f.box.erased) continue;
+        await this.ensurePageLoaded(f.page);
+        const next = this._replaced(f.box.text, replacement);
+        if (next === f.box.text) continue;
+        this.applyReplace(f.page, f.box, next);
+        n++;
+      }
+    } finally { this.hideLoader(); }
+    this.search(this.findQuery);
+    this.toast(`${n} replacement${n === 1 ? "" : "s"} made`, n ? "success" : "");
+    this.setStatus(`${n} replacement${n === 1 ? "" : "s"} made — undo steps back one at a time.`);
+    return n;
+  }
 
   /* ── replace = erase original pixels + draw new text ────────────────── */
 
@@ -413,21 +910,23 @@ export default class Editor {
     return { x: x0, y: box.y, w: x1 - x0, h: box.h };
   }
 
-  applyReplace(page, box, newText) {
+  applyReplace(page, box, newText, opts = {}) {
     box.erased = true;
     const base = this._eraseRegion(page, this._eraseRect(page, box));
+    const dx = opts.dx || 0, dy = opts.dy || 0;
     let anno = null;
     if (newText.trim()) {
       anno = this.drawTextRun(page, {
-        text: newText, x: box.x, y: box.y, w: box.w, h: box.h, base: box.base,
-        size: box.fontSize, color: box.color, bold: box.bold, italic: box.italic, family: box.family,
-        fontName: box.fontName, origLen: box.text.length, kind: box.kind,
-        maxW: this.lineSpace(page, box),
+        text: newText, x: box.x + dx, y: box.y + dy, w: box.w, h: box.h,
+        base: (box.base ?? (box.y + box.h * 0.8)) + dy,
+        ...(opts.style || this._styled(box)),
+        origLen: box.text.length, kind: box.kind,
+        // once moved, the old line's free space says nothing about the new spot
+        maxW: (dx || dy) ? page.w - (box.x + dx) - 6 : this.lineSpace(page, box),
       });
     }
     const idx = this.pages.indexOf(page);
-    this.undoStack.push({ type: "replace", page: idx, boxId: box.id, base, anno });
-    this.redoStack = [];
+    this._pushHistory({ type: "replace", page: idx, boxId: box.id, base, anno });
     this.renderOverlays(page);
     this.updateThumb(idx);
     this.setStatus(newText.trim() ? `Replaced "${box.text}" → "${newText}"` : `Erased "${box.text}"`);
@@ -458,7 +957,7 @@ export default class Editor {
     return clamp(Math.atan((n * sxy - sx * sy) / denom), -0.035, 0.035);
   }
 
-  drawTextRun(page, { text, x, y, w, h, base, size, color, bold, italic, family, fontName, origLen, maxW, kind }) {
+  drawTextRun(page, { text, x, y, w, h, base, size, color, bold, italic, family, fontName, origLen, maxW, kind, stretch = true }) {
     const ctx = page.annoCtx;
     const weight = bold ? "700" : "400";
     const fstyle = italic ? "italic " : "";
@@ -490,14 +989,16 @@ export default class Editor {
     const pad = 6;
     let sx = 1;
     if (master) {
-      sx = clamp(room / Math.max(1, master.width), 0.8, 1.2);       // gentle width match
+      // gentle width match — but only when filling a slot a word used to
+      // occupy; freshly inserted text has no slot and must not be stretched
+      sx = stretch ? clamp(room / Math.max(1, master.width), 0.8, 1.2) : 1;
       tw = master.width * sx;
     } else {
       // pure font fallback
       meas.font = fontStr(fit);
       let nw = meas.measureText(text).width;
       const slot = origLen ? w * (text.length / Math.max(1, origLen)) : nw;
-      sx = clamp(slot / Math.max(1, nw), 0.8, 1.25);
+      sx = stretch ? clamp(slot / Math.max(1, nw), 0.8, 1.25) : 1;
       while (fit > minSize && nw * sx > room) { fit -= 0.5; meas.font = fontStr(fit); nw = meas.measureText(text).width; }
       tw = nw * sx;
     }
@@ -604,8 +1105,7 @@ export default class Editor {
       fd.append("file", await canvasBlob(crop), "crop.png");
       fd.append("rects", JSON.stringify([{ x: rect.x - cx, y: rect.y - cy, w: rect.w, h: rect.h }]));
       fd.append("fillMode", region.mode === "object" ? "object" : "auto");
-      const res = await fetch(this.api + "/api/erase", { method: "POST", body: fd });
-      if (!res.ok) throw new Error("erase");
+      const res = await this._post("/api/erase", fd, { raw: true });
       const img = await loadImage(URL.createObjectURL(await res.blob()));
       if (region.cancelled) return;                  // undone before the patch landed
       const ctx = page.baseCtx;
@@ -616,7 +1116,12 @@ export default class Editor {
       region.after = ctx.getImageData(region.x, region.y, region.w, region.h);
       this.composite(page);
       this.updateThumb(this.pages.indexOf(page));
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      // the flat preview fill is still on screen, so the edit LOOKS applied —
+      // say so, otherwise the background reconstruction degrades in silence
+      console.error(e);
+      this.toast("Background couldn't be rebuilt — that patch is a flat fill.", "error");
+    }
   }
 
   /* ── undo / redo ────────────────────────────────────────────────────── */
@@ -672,6 +1177,11 @@ export default class Editor {
     const marqueeRect = (a, b) => ({ x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
                                      w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) });
     canvas.addEventListener("pointerdown", (e) => {
+      if (this.tool === "text" && e.button === 0 && !this._space) {
+        this.openInsertEditor(page, toCanvas(e));
+        e.preventDefault();
+        return;
+      }
       if ((this.tool === "erase" || this.tool === "copy") && e.button === 0 && !this._space && !this._paste) {
         try { canvas.setPointerCapture(e.pointerId); } catch { /* synthetic/pen events */ }
         const el = document.createElement("div");
@@ -824,9 +1334,8 @@ export default class Editor {
     const after = page.annoCtx.getImageData(x, y, w, h);
     p.el.remove(); this._paste = null;
     const idx = this.pages.indexOf(page);
-    this.undoStack.push({ type: "replace", page: idx, boxId: null, base: null,
-                          anno: { rect: { x, y, w, h }, before, after }, hiddenBoxes: [] });
-    this.redoStack = [];
+    this._pushHistory({ type: "replace", page: idx, boxId: null, base: null,
+                        anno: { rect: { x, y, w, h }, before, after }, hiddenBoxes: [] });
     this.composite(page);
     this.updateThumb(idx);
     this.setStatus("Pasted — ⌘Z to undo.");
@@ -861,8 +1370,7 @@ export default class Editor {
       }
     }
     const idx = this.pages.indexOf(page);
-    this.undoStack.push({ type: "replace", page: idx, boxId: null, base, anno, hiddenBoxes: hidden });
-    this.redoStack = [];
+    this._pushHistory({ type: "replace", page: idx, boxId: null, base, anno, hiddenBoxes: hidden });
     this.composite(page);
     this.renderOverlays(page);
     this.updateThumb(idx);
@@ -877,7 +1385,16 @@ export default class Editor {
     this.pages.forEach((page, i) => {
       const t = document.createElement("div"); t.className = "thumb";
       const tc = newCanvas(180, Math.round(180 * (page.h / page.w)));
-      loadImage(page.thumbSrc).then((img) => tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height)).catch(() => {});
+      // a rebuild (rotate, delete, reorder) must not wipe the edits already
+      // visible in a loaded page's thumbnail — redraw those from the canvas
+      if (page.loaded && page.canvas) {
+        tc.getContext("2d").drawImage(page.canvas, 0, 0, tc.width, tc.height);
+      } else {
+        t.classList.add("loading");                // shimmer until the image lands
+        loadImage(page.thumbSrc)
+          .then((img) => { tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height); t.classList.remove("loading"); })
+          .catch(() => t.classList.remove("loading"));
+      }
       const label = document.createElement("span"); label.className = "thumb-num"; label.textContent = i + 1;
       t.append(tc, label);
       t.addEventListener("click", () => this.showPage(i));
@@ -887,6 +1404,102 @@ export default class Editor {
     this.updateThumbActive();
   }
   updateThumbActive() { if (this.thumbsEl) [...this.thumbsEl.children].forEach((t, i) => t.classList.toggle("active", i === this.current)); }
+
+  /* ── page operations ────────────────────────────────────────────────────── */
+  /* Rotation goes through the server, which re-detects the text on the rotated
+     raster. Rotating the canvases here instead would leave every box pointing
+     at the wrong pixels — and a sideways scan would keep its sideways boxes.
+     The page is reloaded, so its edits are dropped; hasPageEdits() lets the UI
+     warn first. */
+  hasPageEdits(i) { return this.undoStack.some((e) => e.page === i) || this.redoStack.some((e) => e.page === i); }
+
+  async rotatePage(deg = 90) {
+    const idx = this.current, page = this.pages[idx];
+    if (!page || !this.session) return;
+    this.commitReplace(); this.commitInsert();
+    this.setLoading("Rotating…", 60000);
+    try {
+      const fd = new FormData();
+      fd.append("session", this.session);
+      fd.append("page", String(idx));
+      fd.append("deg", String(deg));
+      const { page: p } = await this._post("/api/rotate", fd);
+      page.w = p.width; page.h = p.height; page.scanned = p.scanned;
+      page.boxes = p.boxes.map((b) => ({ ...b, erased: false }));
+      page.loaded = false; page._medSize = null;
+      const bust = `?v=${Date.now()}`;               // same URL, new pixels
+      page.src = `${this.api}/api/page/${this.session}/${idx}${bust}`;
+      page.thumbSrc = `${this.api}/api/thumb/${this.session}/${idx}${bust}`;
+      this._dropHistory((e) => e.page === idx);
+      await this.ensurePageLoaded(page);
+      this.mountPage(page);
+      this.buildThumbs();
+      this.hideLoader();
+      this.toast("Page rotated", "success");
+    } catch (e) {
+      this.hideLoader();
+      this.toast(e.message || "Rotate failed", "error");
+    }
+    this.emit();
+  }
+
+  /* Page order and deletion are mirrored on the server: digitize, AI edit and
+     AI chat all read the session's page list, so a client-only delete would
+     leave them working on pages the user removed minutes ago. */
+  async _applyOrder(order, label) {
+    if (!this.session) return false;
+    const fd = new FormData();
+    fd.append("session", this.session);
+    fd.append("order", JSON.stringify(order));
+    try { await this._post("/api/pages", fd); }
+    catch (e) { this.toast(e.message || `${label} failed`, "error"); return false; }
+    const remap = new Map(order.map((from, to) => [from, to]));
+    this.pages = order.map((i) => this.pages[i]);
+    this._dropHistory((e) => !remap.has(e.page));    // history of deleted pages
+    for (const e of [...this.undoStack, ...this.redoStack]) e.page = remap.get(e.page);
+    this.pages.forEach((p, i) => {
+      p.index = i;
+      p.src = `${this.api}/api/page/${this.session}/${i}`;
+      p.thumbSrc = `${this.api}/api/thumb/${this.session}/${i}`;
+    });
+    if (this.exportSel) {
+      this.exportSel = new Set([...this.exportSel].filter((i) => remap.has(i)).map((i) => remap.get(i)));
+    }
+    this.buildThumbs();
+    return true;
+  }
+
+  async deletePage(i) {
+    if (this.pages.length <= 1) { this.toast("A document needs at least one page", "error"); return; }
+    this.commitReplace(); this.commitInsert();
+    const order = this.pages.map((_, k) => k).filter((k) => k !== i);
+    if (!(await this._applyOrder(order, "Delete"))) return;
+    this.current = -1;                               // the old index means nothing now
+    await this.showPage(Math.min(i, this.pages.length - 1));
+    this.toast("Page deleted", "success");
+  }
+
+  async movePage(i, delta) {
+    const j = i + delta;
+    if (j < 0 || j >= this.pages.length) return;
+    this.commitReplace(); this.commitInsert();
+    const order = this.pages.map((_, k) => k);
+    [order[i], order[j]] = [order[j], order[i]];
+    if (!(await this._applyOrder(order, "Reorder"))) return;
+    this.current = -1;
+    await this.showPage(j);
+  }
+
+  /* Export selection: null means "everything", which stays true as pages come
+     and go — only an explicit unpick creates a Set. */
+  toggleExportPage(i) {
+    const sel = this.exportSel ? new Set(this.exportSel) : new Set(this.pages.map((_, k) => k));
+    if (sel.has(i)) sel.delete(i); else sel.add(i);
+    this.exportSel = sel.size === this.pages.length ? null : sel;
+    this.emit();
+  }
+  selectAllPages() { this.exportSel = null; this.emit(); }
+  _exportIndices() { return this.pages.map((_, i) => i).filter((i) => !this.exportSel || this.exportSel.has(i)); }
   updateThumb(i) {
     const page = this.pages[i];
     if (page && page.canvas && page._thumbCanvas) {
@@ -924,6 +1537,95 @@ export default class Editor {
 
   toggleProposal(id) { this.aiProposals = this.aiProposals.map((p) => (p.id === id ? { ...p, checked: !p.checked } : p)); this.emit(); }
   discardProposals() { this.aiProposals = []; this.emit(); }
+
+  /* ── AI chat ────────────────────────────────────────────────────────────── */
+  async askAi(question) {
+    const q = (question || "").trim();
+    if (!q || !this.session || this.aiLoading) return;
+    this.aiMessages = [...this.aiMessages, { role: "you", text: q }];
+    this.aiLoading = true; this.emit();
+    try {
+      const fd = new FormData();
+      fd.append("session", this.session); fd.append("question", q);
+      const { answer } = await this._post("/api/ai-chat", fd);
+      this.aiMessages = [...this.aiMessages, { role: "ai", text: answer }];
+    } catch (e) {
+      this.aiMessages = [...this.aiMessages, { role: "ai", text: e.message || "AI request failed", error: true }];
+    }
+    this.aiLoading = false; this.emit();
+  }
+  clearChat() { this.aiMessages = []; this.emit(); }
+
+  /* ── AI OCR repair ──────────────────────────────────────────────────────── */
+  /* Gemini re-reads the page image and corrects misread words in place — the
+     best available fix when the right Tesseract language pack isn't installed. */
+  async fixOcr() {
+    const page = this.pages[this.current];
+    if (!page || !this.session || this.ocrFixLoading) return;
+    this.ocrFixLoading = true; this.emit();
+    try {
+      const fd = new FormData();
+      fd.append("session", this.session); fd.append("page", String(this.current));
+      const { fixes } = await this._post("/api/ai-ocr", fd);
+      const byId = new Map(page.boxes.map((b) => [b.id, b]));
+      for (const f of fixes) { const b = byId.get(f.id); if (b) b.text = f.text; }
+      page._medSize = null;
+      page.atlas = new GlyphAtlas().build(page);     // corrected words = better donors
+      this.renderOverlays(page);
+      if (this.findQuery) this.search(this.findQuery);
+      this.toast(fixes.length ? `${fixes.length} OCR misread${fixes.length === 1 ? "" : "s"} corrected` : "OCR looks correct",
+                 fixes.length ? "success" : "");
+    } catch (e) { this.toast(e.message || "OCR fix failed", "error"); }
+    this.ocrFixLoading = false; this.emit();
+  }
+
+  /* ── digitize ───────────────────────────────────────────────────────────── */
+  /* Rebuilds the document from the ORIGINAL server-side render, so it reflects
+     the detected text, not the edits made in this session. */
+  async digitize(useAi = true) {
+    if (!this.session || this.digitizing) return;
+    this.digitizing = true;
+    this.setLoading("Rebuilding with a real text layer…", 300000);
+    try {
+      const fd = new FormData();
+      fd.append("session", this.session);
+      fd.append("useAi", useAi ? "1" : "0");
+      const res = await this._post("/api/digitize", fd, { raw: true });
+      this.download(await res.blob(), "document-digitized.pdf");
+      this.toast("Digitized PDF downloaded", "success");
+    } catch (e) { this.toast(e.message || "Digitize failed", "error"); }
+    this.digitizing = false; this.hideLoader(); this.emit();
+  }
+
+  /* ── AI font identification ─────────────────────────────────────────────── */
+  async findFonts() {
+    if (!this.session || this.fontsLoading) return;
+    this.fontsLoading = true; this.emit();
+    try {
+      const fd = new FormData();
+      fd.append("session", this.session); fd.append("page", String(this.current));
+      const { fonts } = await this._post("/api/ai-fonts", fd);
+      this.fonts = fonts || [];
+      // fetch the faces now, so picking one draws with the real font rather
+      // than silently falling back to the web-safe stack on the first edit
+      for (const f of this.fonts) {
+        ensureWebFont(f.font, { bold: /bold/i.test(f.style || ""), italic: /italic/i.test(f.style || "") });
+      }
+      if (!this.fonts.length) this.toast("No fonts identified");
+    } catch (e) { this.toast(e.message || "Font detection failed", "error"); }
+    this.fontsLoading = false; this.emit();
+  }
+
+  /* Pin an identified font as the one replacements are drawn with. */
+  useFont(f) {
+    this.setStyle({
+      fontName: f.font,
+      family: /courier|mono/i.test(f.font) ? "mono" : /times|georgia|garamond|serif/i.test(f.font) ? "serif" : "sans",
+      bold: /bold/i.test(f.style || "") || null,
+      italic: /italic/i.test(f.style || "") || null,
+    });
+    this.toast(`Replacements will use ${f.font}`, "success");
+  }
 
   async gotoProposal(id) {
     const f = this._findBox(id); if (!f) return;
@@ -982,19 +1684,22 @@ export default class Editor {
   async exportPng() { const page = this.pages[this.current]; if (!page) return; this.download(await canvasBlob(page.canvas), `page-${this.current + 1}.png`); this.toast("PNG downloaded", "success"); }
   async exportPdf() {
     this.commitReplace();
-    this.setLoading("Preparing pages… 0%", Math.max(120000, this.pages.length * 10000));
+    this.commitInsert();
+    const idxs = this._exportIndices();
+    if (!idxs.length) { this.toast("No pages selected for export", "error"); return; }
+    this.setLoading("Preparing pages… 0%", Math.max(120000, idxs.length * 10000));
     let ticker = null;
     try {
       const fd = new FormData();
-      for (let i = 0; i < this.pages.length; i++) {
-        this.progress = (i / this.pages.length) * 0.3;   // page rendering = first 30%
+      for (let n = 0; n < idxs.length; n++) {
+        this.progress = (n / idxs.length) * 0.3;         // page rendering = first 30%
         this.loadingText = `Preparing pages… ${Math.round(this.progress * 100)}%`;
         this.emit();
-        const page = this.pages[i];
+        const page = this.pages[idxs[n]];
         let blob;
         if (page.loaded) blob = await canvasBlob(page.canvas);
         else blob = await (await fetch(page.src)).blob();
-        fd.append("files", blob, `p${i}.png`);
+        fd.append("files", blob, `p${n}.png`);
       }
       const res = await this._upload(this.api + "/api/export", fd, (f) => {
         this.progress = 0.3 + f * 0.6;                   // upload = next 60%
